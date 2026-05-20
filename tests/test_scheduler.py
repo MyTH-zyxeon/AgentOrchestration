@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,48 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_complete_persists_terminal_outcome_once(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.complete(task["id"], result={"ok": True})
+        assert self.scheduler.complete(task["id"], result={"ok": False})
+
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        assert outcome["status"] == "completed"
+        assert outcome["result"] == {"ok": True}
+        assert outcome["retries"] == 0
+
+    def test_fail_retries_same_task_then_records_terminal_failure(self):
+        task_id = self.scheduler.enqueue({"type": "test"}, priority=3)
+
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == task_id
+        for expected_retry in (1, 2):
+            assert self.scheduler.fail(task_id, error="temporary")
+            assert self.scheduler.get_terminal_outcome(task_id) is None
+            task = asyncio.run(self.scheduler.dequeue())
+            assert task["id"] == task_id
+            assert task["retries"] == expected_retry
+
+        assert self.scheduler.fail(task_id, error="final")
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        assert outcome["status"] == "failed"
+        assert outcome["error"] == "final"
+        assert outcome["retries"] == 3
 
 # 2019-01-09T19:07:03 update
 
