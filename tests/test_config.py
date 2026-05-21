@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,24 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_env_overrides_ignore_runtime_only_agent_values(self, monkeypatch):
+        monkeypatch.setenv("AO_AGENT_ID", "agent-runtime-1")
+        monkeypatch.setenv("AO_API_URL", "https://api.example.test")
+
+        config = Config()
+
+        assert config.get("agent.id") is None
+        assert config.to_dict() == {"api": {"url": "https://api.example.test"}}
+
+    def test_env_overrides_support_scoped_config_prefix(self, monkeypatch):
+        monkeypatch.setenv("AO_CONFIG_DATABASE_HOST", "db.internal")
+        monkeypatch.setenv("AO_WORKFLOW_ID", "runtime-workflow-1")
+
+        config = Config()
+
+        assert config.get("database.host") == "db.internal"
+        assert config.get("workflow.id") is None
 
 # 2019-02-01T18:58:35 update
 

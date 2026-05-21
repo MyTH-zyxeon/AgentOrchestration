@@ -1,8 +1,13 @@
 """Configuration management module."""
 
-import os
 import json
+import os
 from typing import Any, Dict, Optional
+
+
+ENV_OVERRIDE_PREFIX = "AO_"
+CONFIG_OVERRIDE_PREFIX = "AO_CONFIG_"
+ALLOWED_ENV_OVERRIDES = frozenset({"AO_API_KEY", "AO_API_URL"})
 
 
 class Config:
@@ -17,11 +22,22 @@ class Config:
             self._data = json.load(f)
 
     def _load_env_overrides(self) -> None:
-        prefix = "AO_"
         for key, value in os.environ.items():
-            if key.startswith(prefix):
-                config_key = key[len(prefix):].lower().replace("_", ".")
+            config_key = self._env_key_to_config_key(key)
+            if config_key is not None:
                 self._set_nested(config_key, value)
+
+    def _env_key_to_config_key(self, key: str) -> Optional[str]:
+        if key in ALLOWED_ENV_OVERRIDES:
+            return key[len(ENV_OVERRIDE_PREFIX):].lower().replace("_", ".")
+
+        if key.startswith(CONFIG_OVERRIDE_PREFIX):
+            config_key = (
+                key[len(CONFIG_OVERRIDE_PREFIX):].lower().replace("_", ".")
+            )
+            return config_key or None
+
+        return None
 
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")
