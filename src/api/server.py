@@ -4,10 +4,13 @@ import os
 from typing import Dict
 
 from fastapi import FastAPI, Depends
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from .routes import router
+from .auth import require_documentation_access
 from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
 
 
@@ -16,8 +19,9 @@ def create_app(config: Dict = None) -> FastAPI:
         title="Agent Orchestrator API",
         version="2.4.1",
         description="Enterprise Agent Orchestration Platform API",
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     app.add_middleware(
@@ -28,7 +32,10 @@ def create_app(config: Dict = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","),
+    )
 
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RateLimitMiddleware)
@@ -39,6 +46,41 @@ def create_app(config: Dict = None) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "healthy", "version": "2.4.1"}
+
+    @app.get(
+        "/api/openapi.json",
+        dependencies=[Depends(require_documentation_access)],
+        include_in_schema=False,
+    )
+    async def openapi_schema():
+        return get_openapi(
+            title=app.title,
+            version=app.version,
+            description=app.description,
+            routes=app.routes,
+        )
+
+    @app.get(
+        "/api/docs",
+        dependencies=[Depends(require_documentation_access)],
+        include_in_schema=False,
+    )
+    async def swagger_docs():
+        return get_swagger_ui_html(
+            openapi_url="/api/openapi.json",
+            title=f"{app.title} - Swagger UI",
+        )
+
+    @app.get(
+        "/api/redoc",
+        dependencies=[Depends(require_documentation_access)],
+        include_in_schema=False,
+    )
+    async def redoc_docs():
+        return get_redoc_html(
+            openapi_url="/api/openapi.json",
+            title=f"{app.title} - ReDoc",
+        )
 
     return app
 
