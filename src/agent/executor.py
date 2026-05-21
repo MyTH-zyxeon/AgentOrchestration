@@ -12,24 +12,59 @@ class AgentExecutor:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self._execution_metadata: Dict[str, Dict[str, Any]] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
-        async with self._semaphore:
-            task_obj = asyncio.create_task(
-                self._run_execution(execution_id, agent_id, task, handler)
-            )
-            self._active_tasks[execution_id] = task_obj
-            try:
-                result = await task_obj
-                self._results[execution_id] = result
-            except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
-            finally:
-                self._active_tasks.pop(execution_id, None)
+        self._execution_metadata[execution_id] = {
+            "agent_id": agent_id,
+            "task_id": task.get("id"),
+        }
+        task_obj = asyncio.create_task(
+            self._execute_background(execution_id, agent_id, task, handler)
+        )
+        self._active_tasks[execution_id] = task_obj
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _execute_background(
+        self,
+        execution_id: str,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> None:
+        try:
+            async with self._semaphore:
+                task_obj = asyncio.create_task(
+                    self._run_execution(execution_id, agent_id, task, handler)
+                )
+                self._active_tasks[execution_id] = task_obj
+                result = await task_obj
+                self._results[execution_id] = result
+        except asyncio.CancelledError:
+            self._store_cancelled_result(
+                execution_id,
+                agent_id=agent_id,
+                task_id=task.get("id"),
+            )
+        except Exception as e:
+            self._results[execution_id] = {"error": str(e)}
+        finally:
+            self._active_tasks.pop(execution_id, None)
+            self._execution_metadata.pop(execution_id, None)
+
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -45,10 +80,29 @@ class AgentExecutor:
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
 
+    def _store_cancelled_result(
+        self,
+        execution_id: str,
+        agent_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> None:
+        metadata = self._execution_metadata.get(execution_id, {})
+        self._results.setdefault(
+            execution_id,
+            {
+                "execution_id": execution_id,
+                "agent_id": agent_id or metadata.get("agent_id"),
+                "task_id": task_id or metadata.get("task_id"),
+                "status": "cancelled",
+                "cancelled_at": time.time(),
+            },
+        )
+
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
         if task and not task.done():
             task.cancel()
+            self._store_cancelled_result(execution_id)
             return True
         return False
 
@@ -56,7 +110,10 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
 
 # 2019-01-31T14:19:34 update
 
