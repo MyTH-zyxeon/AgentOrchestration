@@ -1,5 +1,6 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -13,8 +14,31 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+@dataclass(frozen=True)
+class ArtifactRetentionPolicy:
+    artifact_name: str
+    retention_days: int
+    cleanup_after_step: str
+    policy_version: int = 1
+
+
+@dataclass(frozen=True)
+class ArtifactCleanupDecision:
+    accepted: bool
+    action: str
+    reason: str
+    workflow_status: str
+    artifact_name: str
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -32,6 +56,10 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self.artifact_retention_policies: Dict[
+            str, ArtifactRetentionPolicy
+        ] = {}
+        self.audit_records: List[Dict[str, str]] = []
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
@@ -39,8 +67,94 @@ class Workflow:
         self._step_map[step.id] = step
         return self
 
+    def schedule_artifact_cleanup(
+        self,
+        policy: ArtifactRetentionPolicy,
+        expected_status: StepStatus = StepStatus.PENDING,
+    ) -> ArtifactCleanupDecision:
+        decision = self._validate_artifact_cleanup(policy, expected_status)
+        self._record_artifact_decision(policy, decision)
+        if decision.accepted:
+            self.artifact_retention_policies[policy.artifact_name] = policy
+        return decision
+
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def _validate_artifact_cleanup(
+        self,
+        policy: ArtifactRetentionPolicy,
+        expected_status: StepStatus,
+    ) -> ArtifactCleanupDecision:
+        if self.status != expected_status:
+            return ArtifactCleanupDecision(
+                accepted=False,
+                action="defer",
+                reason="workflow lifecycle changed before cleanup scheduling",
+                workflow_status=self.status.value,
+                artifact_name=policy.artifact_name,
+            )
+
+        if not policy.artifact_name.strip():
+            return ArtifactCleanupDecision(
+                accepted=False,
+                action="reject",
+                reason="artifact name is required",
+                workflow_status=self.status.value,
+                artifact_name="",
+            )
+
+        if policy.retention_days <= 0:
+            return ArtifactCleanupDecision(
+                accepted=False,
+                action="reject",
+                reason="retention days must be positive",
+                workflow_status=self.status.value,
+                artifact_name=policy.artifact_name,
+            )
+
+        if policy.cleanup_after_step not in self._step_map:
+            return ArtifactCleanupDecision(
+                accepted=False,
+                action="reject",
+                reason="cleanup step does not exist",
+                workflow_status=self.status.value,
+                artifact_name=policy.artifact_name,
+            )
+
+        existing = self.artifact_retention_policies.get(policy.artifact_name)
+        if existing and existing.policy_version >= policy.policy_version:
+            return ArtifactCleanupDecision(
+                accepted=False,
+                action="reject",
+                reason="stale or duplicate artifact retention policy",
+                workflow_status=self.status.value,
+                artifact_name=policy.artifact_name,
+            )
+
+        return ArtifactCleanupDecision(
+            accepted=True,
+            action="schedule",
+            reason="artifact cleanup policy accepted",
+            workflow_status=self.status.value,
+            artifact_name=policy.artifact_name,
+        )
+
+    def _record_artifact_decision(
+        self,
+        policy: ArtifactRetentionPolicy,
+        decision: ArtifactCleanupDecision,
+    ) -> None:
+        self.audit_records.append(
+            {
+                "event": "artifact_cleanup_policy",
+                "artifact_name": decision.artifact_name,
+                "action": decision.action,
+                "reason": decision.reason,
+                "workflow_status": decision.workflow_status,
+                "policy_version": str(policy.policy_version),
+            }
+        )
 
 
 class WorkflowManager:
