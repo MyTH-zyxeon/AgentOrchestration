@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,30 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_child_retry_blocked_after_parent_cancel(self):
+        parent_id = "parent-run-1"
+        self.scheduler.enqueue({
+            "type": "child",
+            "parent_id": parent_id,
+            "payload": {"secret": "not-for-audit"},
+        })
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.cancel_parent(parent_id, "operator_cancelled")
+        assert not self.scheduler.fail(task["id"])
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+        audit = self.scheduler.retry_audit()
+        assert audit == [{
+            "task_id": task["id"],
+            "parent_id": parent_id,
+            "decision": "retry_blocked",
+            "reason": "operator_cancelled",
+        }]
+        assert "payload" not in audit[0]
 
 # 2019-01-09T19:07:03 update
 
