@@ -4,6 +4,59 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from src.common.metrics import metrics
+
+
+RESERVED_METADATA_KEYS = frozenset(
+    {
+        "agent_id",
+        "error",
+        "handler",
+        "id",
+        "queue",
+        "result",
+        "retries",
+        "route",
+        "routing",
+        "state",
+        "status",
+        "step_id",
+        "task",
+        "task_id",
+        "timeout",
+        "workflow_id",
+    }
+)
+
+
+class WorkflowMetadataError(ValueError):
+    def __init__(self, owner: str, key_path: str):
+        self.owner = owner
+        self.key_path = key_path
+        super().__init__(f"{owner} metadata contains reserved key: {key_path}")
+
+
+def _find_reserved_metadata_key(
+    metadata: Dict[str, Any],
+    prefix: str = "metadata",
+) -> Optional[str]:
+    for key, value in metadata.items():
+        key_text = str(key)
+        key_path = f"{prefix}.{key_text}"
+        if key_text.lower() in RESERVED_METADATA_KEYS:
+            return key_path
+        if isinstance(value, dict):
+            nested_path = _find_reserved_metadata_key(value, key_path)
+            if nested_path:
+                return nested_path
+    return None
+
+
+def _validate_metadata(metadata: Dict[str, Any], owner: str) -> None:
+    key_path = _find_reserved_metadata_key(metadata)
+    if key_path:
+        raise WorkflowMetadataError(owner, key_path)
+
 
 class StepStatus(Enum):
     PENDING = "pending"
@@ -14,27 +67,47 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.metadata = dict(metadata or {})
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
 
 
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.description = description
+        self.metadata = dict(metadata or {})
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, str]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        try:
+            _validate_metadata(step.metadata, "workflow step")
+        except WorkflowMetadataError as exc:
+            self._record_metadata_rejection("step", step.id, exc.key_path)
+            raise
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
@@ -42,13 +115,49 @@ class Workflow:
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
 
+    def validate_metadata(self) -> None:
+        _validate_metadata(self.metadata, "workflow")
+        for step in self.steps:
+            _validate_metadata(step.metadata, "workflow step")
+
+    def _record_metadata_rejection(
+        self,
+        scope: str,
+        owner_id: str,
+        key_path: str,
+    ) -> None:
+        self.audit_records.append(
+            {
+                "event": "workflow_metadata_rejected",
+                "scope": scope,
+                "owner_id": owner_id,
+                "key_path": key_path,
+                "reason": "reserved_metadata_key",
+            }
+        )
+
 
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self.audit_records: List[Dict[str, str]] = []
 
-    def create_workflow(self, name: str, description: str = "") -> Workflow:
-        workflow = Workflow(name, description)
+    def create_workflow(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Workflow:
+        workflow = Workflow(name, description, metadata)
+        try:
+            _validate_metadata(workflow.metadata, "workflow")
+        except WorkflowMetadataError as exc:
+            self._record_metadata_rejection(
+                "workflow",
+                workflow.id,
+                exc.key_path,
+            )
+            raise
         self._workflows[workflow.id] = workflow
         return workflow
 
@@ -66,6 +175,22 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        try:
+            workflow.validate_metadata()
+        except WorkflowMetadataError as exc:
+            self._record_metadata_rejection(
+                "workflow",
+                workflow.id,
+                exc.key_path,
+            )
+            workflow._record_metadata_rejection(
+                "workflow",
+                workflow.id,
+                exc.key_path,
+            )
+            metrics.increment("workflow.metadata.rejected")
+            return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
@@ -81,6 +206,22 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _record_metadata_rejection(
+        self,
+        scope: str,
+        owner_id: str,
+        key_path: str,
+    ) -> None:
+        self.audit_records.append(
+            {
+                "event": "workflow_metadata_rejected",
+                "scope": scope,
+                "owner_id": owner_id,
+                "key_path": key_path,
+                "reason": "reserved_metadata_key",
+            }
+        )
 
 # 2019-03-27T19:58:07 update
 
