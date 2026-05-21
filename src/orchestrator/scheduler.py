@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -35,26 +34,44 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._workflow_blackouts: Dict[str, Dict[str, Any]] = {}
+        self._dispatch_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,12 +82,60 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                blackout = self._active_workflow_blackout(task, now)
+                if blackout:
+                    task["deferred_until"] = blackout["end_at"]
+                    task["deferred_reason"] = blackout["reason"]
+                    self._dispatch_audit.append({
+                        "task_id": task["id"],
+                        "workflow_id": task["workflow_id"],
+                        "decision": "dispatch_deferred",
+                        "reason": blackout["reason"],
+                        "deferred_until": blackout["end_at"],
+                    })
+                    self._queues[queue].push(task, task.get("priority", 0))
+                    return None
+
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
         return self._in_flight.pop(task_id, None) is not None
+
+    def set_workflow_blackout(
+        self,
+        workflow_id: str,
+        start_at: float,
+        end_at: float,
+        reason: str = "workflow_blackout",
+    ) -> bool:
+        if not workflow_id or end_at <= start_at:
+            return False
+        self._workflow_blackouts[workflow_id] = {
+            "start_at": start_at,
+            "end_at": end_at,
+            "reason": reason,
+        }
+        return True
+
+    def dispatch_audit(self) -> List[Dict[str, Any]]:
+        return list(self._dispatch_audit)
+
+    def _active_workflow_blackout(
+        self,
+        task: Dict,
+        now: float,
+    ) -> Optional[Dict[str, Any]]:
+        workflow_id = task.get("workflow_id")
+        if not workflow_id:
+            return None
+        blackout = self._workflow_blackouts.get(workflow_id)
+        if not blackout:
+            return None
+        if blackout["start_at"] <= now < blackout["end_at"]:
+            return blackout
+        return None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)

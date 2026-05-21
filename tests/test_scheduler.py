@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,49 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_workflow_blackout_defers_dispatch(self):
+        import asyncio
+        import time
+
+        now = time.time()
+        workflow_id = "workflow-1"
+        task_id = self.scheduler.enqueue({
+            "type": "test",
+            "workflow_id": workflow_id,
+            "payload": {"secret": "not-for-audit"},
+        })
+
+        assert self.scheduler.set_workflow_blackout(
+            workflow_id,
+            now - 10,
+            now + 60,
+            reason="maintenance_window",
+        )
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+        audit = self.scheduler.dispatch_audit()
+        assert audit == [{
+            "task_id": task_id,
+            "workflow_id": workflow_id,
+            "decision": "dispatch_deferred",
+            "reason": "maintenance_window",
+            "deferred_until": audit[0]["deferred_until"],
+        }]
+        assert audit[0]["deferred_until"] > now
+        assert "payload" not in audit[0]
+
+        assert self.scheduler.set_workflow_blackout(
+            workflow_id,
+            now - 120,
+            now - 60,
+        )
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["deferred_reason"] == "maintenance_window"
+        assert task["deferred_until"] == audit[0]["deferred_until"]
+        assert task["payload"] == {"secret": "not-for-audit"}
 
 # 2019-01-09T19:07:03 update
 
