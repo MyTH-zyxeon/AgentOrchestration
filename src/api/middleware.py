@@ -11,8 +11,15 @@ logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +33,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -42,12 +55,113 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class SSECompressionGuardMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        wants_event_stream = self._wants_event_stream(request)
+        request.state.sse_compression_guard = wants_event_stream
+        try:
+            identity_allowed = self._accepts_identity_encoding(request)
+            if wants_event_stream and not identity_allowed:
+                logger.info(
+                    "Rejected SSE request disallowing identity encoding: %s",
+                    request.url.path,
+                )
+                return Response(
+                    status_code=406,
+                    content="SSE requires identity response encoding",
+                    headers={
+                        "Cache-Control": "no-cache, no-transform",
+                        "Content-Encoding": "identity",
+                    },
+                )
+
+            response = await call_next(request)
+            if wants_event_stream or self._is_event_stream_response(response):
+                response.headers["Content-Encoding"] = "identity"
+                response.headers["X-Accel-Buffering"] = "no"
+                self._add_no_transform(response)
+            return response
+        except Exception:
+            logger.exception(
+                "SSE compression guard failed while handling %s",
+                request.url.path,
+            )
+            raise
+        finally:
+            if hasattr(request.state, "sse_compression_guard"):
+                delattr(request.state, "sse_compression_guard")
+
+    def _wants_event_stream(self, request: Request) -> bool:
+        return "text/event-stream" in request.headers.get("accept", "").lower()
+
+    def _is_event_stream_response(self, response: Response) -> bool:
+        return response.headers.get("content-type", "").lower().startswith(
+            "text/event-stream"
+        )
+
+    def _accepts_identity_encoding(self, request: Request) -> bool:
+        header = request.headers.get("accept-encoding", "")
+        if not header:
+            return True
+
+        identity_qvalue = None
+        wildcard_qvalue = None
+        for raw_part in header.split(","):
+            token, _, raw_params = raw_part.strip().partition(";")
+            token = token.lower()
+            qvalue = 1.0
+            for param in raw_params.split(";"):
+                name, _, value = param.strip().partition("=")
+                if name.lower() == "q" and value:
+                    try:
+                        qvalue = float(value)
+                    except ValueError:
+                        qvalue = 0.0
+            if token == "identity":
+                identity_qvalue = qvalue
+            elif token == "*":
+                wildcard_qvalue = qvalue
+
+        if identity_qvalue is not None:
+            return identity_qvalue > 0
+        if wildcard_qvalue is not None:
+            return wildcard_qvalue > 0
+        return True
+
+    def _add_no_transform(self, response: Response) -> None:
+        cache_control = response.headers.get("Cache-Control", "")
+        directives = [
+            directive.strip()
+            for directive in cache_control.split(",")
+            if directive.strip()
+        ]
+        lowered = {directive.lower() for directive in directives}
+        for directive in ("no-cache", "no-transform"):
+            if directive not in lowered:
+                directives.append(directive)
+        response.headers["Cache-Control"] = ", ".join(directives)
+
+
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
