@@ -1,25 +1,60 @@
 """Agent Sandbox — Isolated execution environment for agents."""
 
-import os
 import tempfile
 import resource
 from typing import Dict, Optional
 from pathlib import Path
 
+from src.common.errors import ConfigurationError
+
 
 class ResourceLimits:
-    def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
-        self.cpu_time = cpu_time
-        self.memory_mb = memory_mb
-        self.disk_mb = disk_mb
+    def __init__(
+        self,
+        cpu_time: int = 60,
+        memory_mb: int = 512,
+        disk_mb: int = 100,
+    ):
+        self.cpu_time = self._validate_limit("cpu_time", cpu_time)
+        self.memory_mb = self._validate_limit("memory_mb", memory_mb)
+        self.disk_mb = self._validate_limit("disk_mb", disk_mb)
+
+    @staticmethod
+    def _validate_limit(name: str, value: int) -> int:
+        if isinstance(value, bool):
+            raise ConfigurationError(f"{name} must be a positive integer")
+
+        try:
+            limit = int(value)
+        except (TypeError, ValueError) as exc:
+            message = f"{name} must be a positive integer"
+            raise ConfigurationError(message) from exc
+
+        if limit <= 0:
+            raise ConfigurationError(f"{name} must be a positive integer")
+
+        return limit
+
+    def validate(self) -> None:
+        self.cpu_time = self._validate_limit("cpu_time", self.cpu_time)
+        self.memory_mb = self._validate_limit("memory_mb", self.memory_mb)
+        self.disk_mb = self._validate_limit("disk_mb", self.disk_mb)
 
 
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
-        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
+        self.base_path = Path(
+            base_path or tempfile.mkdtemp(prefix="ao_sandbox_")
+        )
         self._sandboxes: Dict[str, Path] = {}
 
-    def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
+    def create(
+        self,
+        agent_id: str,
+        limits: Optional[ResourceLimits] = None,
+    ) -> Path:
+        if limits is not None:
+            limits.validate()
         sandbox_path = self.base_path / agent_id
         sandbox_path.mkdir(parents=True, exist_ok=True)
         self._sandboxes[agent_id] = sandbox_path
@@ -37,11 +72,15 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        limits.validate()
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (limits.cpu_time, limits.cpu_time),
+            )
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, resource.error):
             pass
 
     def cleanup_all(self) -> None:
