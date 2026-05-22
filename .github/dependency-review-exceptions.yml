@@ -1,0 +1,6 @@
+# Time-bound dependency review exceptions.
+#
+# Add an entry only when a dependency review failure is intentionally
+# overridden. CI rejects expired entries and rejects overrides whose dependency
+# coordinates are not tracked here.
+exceptions: []
