@@ -20,9 +20,13 @@ class TestMetricsCollector:
     def test_observe(self):
         self.metrics.observe("response.time", 0.5)
         self.metrics.observe("response.time", 1.5)
+        self.metrics.observe("response.time", 12.0)
         snapshot = self.metrics.snapshot()
-        assert snapshot["histograms"]["response.time"]["count"] == 2
-        assert snapshot["histograms"]["response.time"]["avg"] == 1.0
+        response_time = snapshot["histograms"]["response.time"]
+        assert response_time["count"] == 3
+        assert response_time["avg"] == pytest.approx(14.0 / 3)
+        assert response_time["min"] == 0.5
+        assert response_time["max"] == 12.0
 
     def test_timer(self):
         self.metrics.start_timer("operation")
