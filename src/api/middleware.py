@@ -1,8 +1,9 @@
 """API middleware components."""
 
+import asyncio
 import time
 import logging
-from typing import Callable
+from typing import Callable, Dict, MutableMapping
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,9 +11,93 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+class RequestTimeoutMiddleware:
+    def __init__(self, app, timeout_seconds: float = 30.0):
+        self.app = app
+        self.timeout_seconds = float(timeout_seconds)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        state = scope.setdefault("state", {})
+        state["request_timeout_seconds"] = self.timeout_seconds
+        response_started = False
+
+        async def send_with_timeout_headers(message: MutableMapping) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+                headers = list(message.get("headers", []))
+                headers.append((
+                    b"x-request-timeout-ms",
+                    str(int(self.timeout_seconds * 1000)).encode("ascii"),
+                ))
+                message["headers"] = headers
+            await send(message)
+
+        try:
+            await asyncio.wait_for(
+                self.app(scope, receive, send_with_timeout_headers),
+                timeout=self.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            await self._send_timeout(scope, send, response_started)
+        finally:
+            state.pop("request_timeout_seconds", None)
+
+    async def _send_timeout(
+        self,
+        scope: Dict,
+        send: Callable,
+        response_started: bool,
+    ) -> None:
+        logger.warning(
+            "request timed out",
+            extra={
+                "method": scope.get("method", ""),
+                "path": scope.get("path", ""),
+            },
+        )
+        if response_started:
+            await send({
+                "type": "http.response.body",
+                "body": b"",
+                "more_body": False,
+            })
+            return
+
+        timeout_ms = str(int(self.timeout_seconds * 1000)).encode("ascii")
+        headers = [
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"cache-control", b"no-store"),
+            (b"x-request-timeout", b"true"),
+            (b"x-request-timeout-ms", timeout_ms),
+        ]
+        await send({
+            "type": "http.response.start",
+            "status": 504,
+            "headers": headers,
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b"Request timed out",
+            "more_body": False,
+        })
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        is_protected_api = (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        )
+        if is_protected_api:
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +111,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +134,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
