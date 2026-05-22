@@ -1,4 +1,5 @@
-import pytest
+from datetime import datetime, timezone
+
 from src.common.metrics import MetricsCollector
 
 
@@ -30,6 +31,19 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_snapshot_includes_stable_collection_timestamp(self):
+        before = datetime.now(timezone.utc)
+
+        snapshot = self.metrics.snapshot()
+
+        assert "collected_at" in snapshot
+        collected_at = datetime.fromisoformat(
+            snapshot["collected_at"].replace("Z", "+00:00")
+        )
+        after = datetime.now(timezone.utc)
+        assert before <= collected_at <= after
+        assert snapshot["collected_at"].endswith("Z")
 
 # 2019-07-16T09:29:21 update
 
