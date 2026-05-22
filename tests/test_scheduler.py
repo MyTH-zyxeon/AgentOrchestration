@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,77 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dequeue_respects_separate_priority_class_budgets(self):
+        scheduler = TaskScheduler(
+            priority_class_budgets={"urgent": 1, "default": 1}
+        )
+        first_urgent_id = scheduler.enqueue(
+            {"type": "urgent-1"},
+            priority=10,
+            priority_class="urgent",
+        )
+        second_urgent_id = scheduler.enqueue(
+            {"type": "urgent-2"},
+            priority=9,
+            priority_class="urgent",
+        )
+        scheduler.enqueue(
+            {"type": "default"},
+            priority=0,
+            priority_class="default",
+        )
+
+        first = asyncio.run(scheduler.dequeue())
+        second = asyncio.run(scheduler.dequeue())
+        blocked = asyncio.run(scheduler.dequeue())
+
+        assert first["id"] == first_urgent_id
+        assert second["type"] == "default"
+        assert blocked is None
+
+        assert scheduler.complete(first_urgent_id)
+        next_urgent = asyncio.run(scheduler.dequeue())
+        assert next_urgent["id"] == second_urgent_id
+
+    def test_priority_class_deferral_preserves_task_and_audits_metadata(self):
+        scheduler = TaskScheduler(
+            priority_class_budgets={"urgent": 1},
+            audit_limit=2,
+        )
+        scheduler.enqueue(
+            {"type": "urgent-1", "payload": {"secret": "redacted"}},
+            priority=10,
+        )
+        deferred_id = scheduler.enqueue({"type": "urgent-2"}, priority=10)
+
+        first = asyncio.run(scheduler.dequeue())
+        blocked = asyncio.run(scheduler.dequeue())
+
+        assert first["type"] == "urgent-1"
+        assert blocked is None
+
+        audit_record = scheduler.audit_records[-1]
+        assert audit_record["event"] == "priority_class_deferred"
+        assert audit_record["reason"] == "priority_class_budget_exhausted"
+        assert audit_record["priority_classes"] == ["urgent"]
+        assert "payload" not in audit_record
+
+        assert scheduler.complete(first["id"])
+        deferred = asyncio.run(scheduler.dequeue())
+        assert deferred["id"] == deferred_id
 
 # 2019-01-09T19:07:03 update
 
