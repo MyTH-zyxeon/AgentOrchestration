@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,21 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_env_override_prefers_existing_literal_underscore_key(
+        self, tmp_path, monkeypatch
+    ):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(
+            '{"api_url": "https://default.example", '
+            '"api": {"url": "https://nested.example"}}'
+        )
+        monkeypatch.setenv("AO_API_URL", "https://env.example")
+
+        config = Config(str(config_file))
+
+        assert config.get("api_url") == "https://env.example"
+        assert config.get("api.url") == "https://nested.example"
 
 # 2019-02-01T18:58:35 update
 
