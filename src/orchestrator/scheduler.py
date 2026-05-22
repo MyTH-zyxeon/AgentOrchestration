@@ -1,10 +1,14 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import logging
 import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+from src.common.errors import MalformedPayloadError
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -33,38 +37,67 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._malformed_records = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        self._prepare_task_record(task)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
+        return task["id"]
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        self._prepare_task_record(task)
+        self._scheduled[task["id"]] = {
+            "due_at": time.time() + delay,
+            "priority": priority,
+            "queue": queue,
+            "task": task,
+        }
+        return task["id"]
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, record in self._scheduled.items()
+            if record["due_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            record = self._scheduled.pop(tid)
+            self.enqueue(
+                record["task"],
+                record["queue"],
+                priority=record["priority"],
+            )
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
+        while queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                try:
+                    self._validate_task_record(task)
+                except MalformedPayloadError as exc:
+                    self._record_malformed_task(task, exc)
+                    continue
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -80,6 +113,69 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def malformed_records(self) -> list:
+        return list(self._malformed_records)
+
+    def _prepare_task_record(self, task: Dict) -> None:
+        if not isinstance(task, dict):
+            raise MalformedPayloadError(
+                "unknown",
+                "task record must be a dict",
+            )
+
+        task.setdefault("id", str(uuid4()))
+        task.setdefault("enqueued_at", time.time())
+        task.setdefault("retries", 0)
+        self._validate_task_record(task)
+
+    def _validate_task_record(self, task: Dict) -> None:
+        if not isinstance(task, dict):
+            raise MalformedPayloadError(
+                "unknown",
+                "task record must be a dict",
+            )
+
+        task_id = str(task.get("id") or "unknown")
+        if not isinstance(task.get("type"), str) or not task["type"]:
+            raise MalformedPayloadError(
+                task_id,
+                "type must be a non-empty string",
+            )
+        if "payload" not in task:
+            raise MalformedPayloadError(task_id, "payload is required")
+        if not isinstance(task["payload"], (dict, list)):
+            raise MalformedPayloadError(
+                task_id,
+                "payload must be a dict or list",
+            )
+        retries = task.get("retries", 0)
+        if (
+            isinstance(retries, bool)
+            or not isinstance(retries, int)
+            or retries < 0
+        ):
+            raise MalformedPayloadError(
+                task_id,
+                "retries must be a non-negative int",
+            )
+
+    def _record_malformed_task(
+        self,
+        task: Any,
+        exc: MalformedPayloadError,
+    ) -> None:
+        task_id = (
+            task.get("id", "unknown")
+            if isinstance(task, dict)
+            else "unknown"
+        )
+        self._malformed_records.append({"id": task_id, "reason": exc.reason})
+        logger.warning(
+            "Skipping malformed queue record %s: %s",
+            task_id,
+            exc.reason,
+        )
 
 # 2019-04-25T08:37:12 update
 

@@ -1,5 +1,6 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.common.errors import MalformedPayloadError
+from src.orchestrator.scheduler import PriorityQueue, TaskScheduler
 
 
 class TestTaskScheduler:
@@ -18,23 +19,66 @@ class TestTaskScheduler:
         assert task["type"] == "test"
 
     def test_enqueue_multiple_priorities(self):
-        self.scheduler.enqueue({"type": "low"}, priority=1)
-        self.scheduler.enqueue({"type": "high"}, priority=10)
+        self.scheduler.enqueue({"type": "low", "payload": {}}, priority=1)
+        self.scheduler.enqueue({"type": "high", "payload": {}}, priority=10)
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
-        self.scheduler.enqueue({"type": "test"})
+        self.scheduler.enqueue({"type": "test", "payload": {}})
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
-        self.scheduler.enqueue({"type": "test"})
+        self.scheduler.enqueue({"type": "test", "payload": {}})
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_enqueue_rejects_malformed_payload(self):
+        with pytest.raises(MalformedPayloadError):
+            self.scheduler.enqueue({"type": "test"})
+        with pytest.raises(MalformedPayloadError):
+            self.scheduler.enqueue({"type": "test", "payload": "stale"})
+        with pytest.raises(MalformedPayloadError):
+            self.scheduler.enqueue("legacy-string-record")
+
+    def test_dequeue_skips_malformed_legacy_record(self):
+        self.scheduler._queues["default"] = PriorityQueue()
+        self.scheduler._queues["default"].push(
+            "legacy-string-record",
+            priority=10,
+        )
+        self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["type"] == "test"
+        assert self.scheduler.malformed_records() == [
+            {"id": "unknown", "reason": "task record must be a dict"}
+        ]
+
+    def test_fail_preserves_lifecycle_state_for_retry(self):
+        task_id = self.scheduler.enqueue({"type": "test", "payload": {}})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.fail(task["id"])
+        retried = asyncio.run(self.scheduler.dequeue())
+
+        assert retried["id"] == task_id
+        assert retried["retries"] == 1
+
+    def test_schedule_dequeues_task_after_delay(self):
+        self.scheduler.schedule({"type": "test", "payload": []}, delay=0)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["type"] == "test"
 
 # 2019-01-09T19:07:03 update
 
