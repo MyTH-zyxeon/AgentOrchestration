@@ -1,7 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
 
 
@@ -13,16 +13,62 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowParameterError(ValueError):
+    """Raised when workflow parameters cannot be safely bound."""
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        parameter_defaults: Optional[Dict[str, Any]] = None,
+        parameters: Optional[Dict[str, Any]] = None,
+        required_parameters: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.parameter_defaults = dict(parameter_defaults or {})
+        self.parameters = dict(parameters or {})
+        self.required_parameters: Set[str] = set(required_parameters or [])
+        self.parameter_audit: List[Dict[str, Any]] = []
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+
+    def bind_parameters(
+        self,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        merged = dict(self.parameter_defaults)
+        merged.update(self.parameters)
+        if parameters is not None:
+            merged.update(parameters)
+
+        missing = sorted(
+            key for key in self.required_parameters if key not in merged
+        )
+        if missing:
+            self.parameter_audit.append({
+                "event": "parameters_rejected",
+                "missing": missing,
+            })
+            missing_keys = ", ".join(missing)
+            raise WorkflowParameterError(
+                f"Missing required workflow parameters: {missing_keys}"
+            )
+
+        self.parameters = merged
+        self.parameter_audit.append({
+            "event": "parameters_bound",
+            "keys": sorted(merged),
+        })
+        return dict(merged)
 
 
 class Workflow:
@@ -66,11 +112,20 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        bound_parameters: Dict[str, Dict[str, Any]] = {}
+        for step in workflow.steps:
+            try:
+                bound_parameters[step.id] = step.bind_parameters()
+            except WorkflowParameterError as e:
+                step.error = str(e)
+                return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
-                result = step.handler()
+                params = bound_parameters[step.id]
+                result = step.handler(**params) if params else step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
