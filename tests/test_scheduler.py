@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,97 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_batch_acknowledge_rejects_wrong_worker(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        result = self.scheduler.batch_acknowledge(
+            [
+                {
+                    "task_id": task["id"],
+                    "worker_id": "worker-b",
+                    "action": "complete",
+                },
+            ]
+        )
+
+        assert result == [
+            {
+                "task_id": task["id"],
+                "status": "rejected",
+                "reason": "wrong_worker",
+            },
+        ]
+        assert self.scheduler.complete(task["id"], worker_id="worker-a")
+        assert self.scheduler.ack_audit()[-2]["reason"] == "wrong_worker"
+        assert "payload" not in self.scheduler.ack_audit()[-2]
+
+    def test_batch_acknowledge_complete_is_idempotent(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        ack = {
+            "task_id": task["id"],
+            "worker_id": "worker-a",
+            "action": "complete",
+        }
+
+        first = self.scheduler.batch_acknowledge([ack])
+        second = self.scheduler.batch_acknowledge([ack])
+
+        assert first == [
+            {
+                "task_id": task["id"],
+                "status": "acknowledged",
+                "action": "complete",
+            },
+        ]
+        assert second == [
+            {
+                "task_id": task["id"],
+                "status": "duplicate",
+                "action": "complete",
+            },
+        ]
+
+    def test_batch_acknowledge_fail_requeues_owned_task(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        task_id = task["id"]
+
+        result = self.scheduler.batch_acknowledge(
+            [
+                {
+                    "task_id": task_id,
+                    "worker_id": "worker-a",
+                    "action": "fail",
+                },
+            ]
+        )
+        retried = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+
+        assert result == [
+            {
+                "task_id": task_id,
+                "status": "acknowledged",
+                "action": "fail",
+            },
+        ]
+        assert retried is not None
+        assert retried["retries"] == 1
+        assert retried["assigned_worker"] == "worker-b"
 
 # 2019-01-09T19:07:03 update
 

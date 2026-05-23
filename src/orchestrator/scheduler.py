@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -35,26 +34,45 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._acked_tasks: Dict[str, Dict[str, Any]] = {}
+        self._ack_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["priority"] = priority
+        task["retries"] = task.get("retries", 0)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+        worker_id: Optional[str] = None,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,21 +83,159 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                if worker_id is not None:
+                    task["assigned_worker"] = worker_id
+                task["dequeued_at"] = now
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def complete(self, task_id: str, worker_id: Optional[str] = None) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task or not self._worker_owns_task(task, worker_id):
+            if task:
+                self._record_ack_audit(
+                    task,
+                    worker_id,
+                    "wrong_worker",
+                    "complete",
+                )
+            return False
+        self._in_flight.pop(task_id)
+        self._acked_tasks[task_id] = {
+            "action": "complete",
+            "worker_id": worker_id,
+        }
+        self._record_ack_audit(task, worker_id, "acknowledged", "complete")
+        return True
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        worker_id: Optional[str] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task or not self._worker_owns_task(task, worker_id):
+            if task:
+                self._record_ack_audit(task, worker_id, "wrong_worker", "fail")
+            return False
+
+        self._in_flight.pop(task_id)
+        task["retries"] += 1
+        task.pop("assigned_worker", None)
+        task.pop("dequeued_at", None)
+        self._acked_tasks[task_id] = {
+            "action": "fail",
+            "worker_id": worker_id,
+        }
+        self._record_ack_audit(task, worker_id, "acknowledged", "fail")
+        if task["retries"] < self._max_retries:
+            self.enqueue(task, queue, priority=task.get("priority", 0))
+            return True
         return False
+
+    def batch_acknowledge(
+        self,
+        acknowledgements: List[Dict[str, str]],
+        queue: str = "default",
+    ) -> List[Dict[str, Any]]:
+        return [self._acknowledge_one(ack, queue) for ack in acknowledgements]
+
+    def ack_audit(self) -> List[Dict[str, Any]]:
+        return list(self._ack_audit)
+
+    def _acknowledge_one(
+        self,
+        ack: Dict[str, str],
+        queue: str,
+    ) -> Dict[str, Any]:
+        task_id = ack.get("task_id")
+        worker_id = ack.get("worker_id")
+        action = ack.get("action", "complete")
+        if not task_id or action not in {"complete", "fail"}:
+            self._record_ack_audit(
+                None,
+                worker_id,
+                "malformed",
+                action,
+                task_id,
+            )
+            return {
+                "task_id": task_id,
+                "status": "malformed",
+                "action": action,
+            }
+
+        if task_id in self._acked_tasks:
+            self._record_ack_audit(
+                None,
+                worker_id,
+                "duplicate",
+                action,
+                task_id,
+            )
+            return {
+                "task_id": task_id,
+                "status": "duplicate",
+                "action": action,
+            }
+
+        task = self._in_flight.get(task_id)
+        if not task:
+            self._record_ack_audit(
+                None,
+                worker_id,
+                "not_in_flight",
+                action,
+                task_id,
+            )
+            return {
+                "task_id": task_id,
+                "status": "not_in_flight",
+                "action": action,
+            }
+
+        if not worker_id or not self._worker_owns_task(task, worker_id):
+            self._record_ack_audit(task, worker_id, "wrong_worker", action)
+            return {
+                "task_id": task_id,
+                "status": "rejected",
+                "reason": "wrong_worker",
+            }
+
+        if action == "complete":
+            self.complete(task_id, worker_id=worker_id)
+        else:
+            self.fail(task_id, queue=queue, worker_id=worker_id)
+        return {
+            "task_id": task_id,
+            "status": "acknowledged",
+            "action": action,
+        }
+
+    def _worker_owns_task(self, task: Dict, worker_id: Optional[str]) -> bool:
+        assigned_worker = task.get("assigned_worker")
+        return worker_id is None or assigned_worker == worker_id
+
+    def _record_ack_audit(
+        self,
+        task: Optional[Dict],
+        worker_id: Optional[str],
+        reason: str,
+        action: str,
+        task_id: Optional[str] = None,
+    ) -> None:
+        self._ack_audit.append(
+            {
+                "task_id": task_id or (task or {}).get("id"),
+                "worker_id": worker_id,
+                "assigned_worker": (task or {}).get("assigned_worker"),
+                "action": action,
+                "reason": reason,
+                "recorded_at": time.time(),
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 
