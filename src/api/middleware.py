@@ -1,8 +1,10 @@
 """API middleware components."""
 
-import time
 import logging
-from typing import Callable
+import os
+import time
+from dataclasses import dataclass
+from typing import Callable, Optional, Set
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,12 +12,123 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class AuthPrincipal:
+    kind: str
+    workspace_id: str
+    permission: str
+    issued_at: float
+    token_id: str
+
+
+class AutomationAuthPolicy:
+    USER_ROLES = {"admin", "operator", "viewer"}
+    USER_WRITE_ROLES = {"admin", "operator"}
+    MACHINE_SCOPES = {"read", "write", "dispatch"}
+    MACHINE_WRITE_SCOPES = {"write", "dispatch"}
+    READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+    def __init__(
+        self,
+        max_age_seconds: int = 3600,
+        revoked_token_ids: Optional[Set[str]] = None,
+        now: Callable[[], float] = time.time,
+    ):
+        self.max_age_seconds = max_age_seconds
+        self.revoked_token_ids = revoked_token_ids or _csv_set(
+            os.getenv("AO_REVOKED_TOKENS", "")
+        )
+        self.now = now
+
+    def authenticate(
+        self,
+        token: str,
+        workspace_id: str,
+    ) -> Optional[AuthPrincipal]:
+        principal = self._parse_token(token)
+        if principal is None:
+            return None
+        if not workspace_id or principal.workspace_id != workspace_id:
+            return None
+        if principal.token_id in self.revoked_token_ids:
+            return None
+        if principal.issued_at + self.max_age_seconds < self.now():
+            return None
+        return principal
+
+    def can_access(self, principal: AuthPrincipal, method: str) -> bool:
+        if method.upper() in self.READ_METHODS:
+            return self._has_read_access(principal)
+        return self._has_write_access(principal)
+
+    def _parse_token(self, token: str) -> Optional[AuthPrincipal]:
+        parts = token.split(":")
+        if len(parts) != 5:
+            return None
+        kind, workspace_id, permission, issued_at_raw, token_id = parts
+        if not all(parts):
+            return None
+        if kind == "user" and permission not in self.USER_ROLES:
+            return None
+        if kind == "machine" and permission not in self.MACHINE_SCOPES:
+            return None
+        if kind not in {"user", "machine"}:
+            return None
+        try:
+            issued_at = float(issued_at_raw)
+        except ValueError:
+            return None
+        return AuthPrincipal(
+            kind,
+            workspace_id,
+            permission,
+            issued_at,
+            token_id,
+        )
+
+    def _has_read_access(self, principal: AuthPrincipal) -> bool:
+        if principal.kind == "user":
+            return principal.permission in self.USER_ROLES
+        return principal.permission in self.MACHINE_SCOPES
+
+    def _has_write_access(self, principal: AuthPrincipal) -> bool:
+        if principal.kind == "user":
+            return principal.permission in self.USER_WRITE_ROLES
+        return principal.permission in self.MACHINE_WRITE_SCOPES
+
+
+def _csv_set(value: str) -> Set[str]:
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
+    def __init__(
+        self,
+        app,
+        auth_policy: Optional[AutomationAuthPolicy] = None,
+    ):
+        super().__init__(app)
+        self.auth_policy = auth_policy or AutomationAuthPolicy()
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        protected_api = request.url.path.startswith("/api/v2")
+        token_endpoint = request.url.path == "/api/v2/auth/token"
+        if protected_api and not token_endpoint:
+            authorization = request.headers.get("Authorization", "")
+            if not authorization.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
+            token = authorization.removeprefix("Bearer ").strip()
+            workspace_id = request.headers.get("X-Workspace-ID", "")
+            principal = self.auth_policy.authenticate(token, workspace_id)
+            if principal is None:
+                return Response(status_code=401, content="Unauthorized")
+            if not self.auth_policy.can_access(principal, request.method):
+                return Response(status_code=403, content="Forbidden")
+            request.state.auth_principal = principal
         return await call_next(request)
 
 
@@ -26,14 +139,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +162,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
