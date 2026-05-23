@@ -1,5 +1,19 @@
-import pytest
-from src.orchestrator.scheduler import TaskScheduler
+import importlib.util
+from pathlib import Path
+
+
+_SCHEDULER_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "orchestrator"
+    / "scheduler.py"
+)
+_SCHEDULER_SPEC = importlib.util.spec_from_file_location(
+    "orchestrator_scheduler", _SCHEDULER_PATH
+)
+_SCHEDULER_MODULE = importlib.util.module_from_spec(_SCHEDULER_SPEC)
+_SCHEDULER_SPEC.loader.exec_module(_SCHEDULER_MODULE)
+TaskScheduler = _SCHEDULER_MODULE.TaskScheduler
 
 
 class TestTaskScheduler:
@@ -35,6 +49,64 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_retry_counts_are_attempt_scoped(self):
+        self.scheduler._max_retries = 2
+        self.scheduler.enqueue({"type": "test", "priority": 4})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"], attempt_id="branch-a")
+        assert self.scheduler.retry_count(task["id"], "branch-a") == 1
+        assert self.scheduler.retry_count(task["id"], "branch-b") == 0
+
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task["id"]
+        assert retried["retries"] == 1
+
+        assert self.scheduler.fail(retried["id"], attempt_id="branch-b")
+        assert self.scheduler.retry_count(task["id"], "branch-a") == 1
+        assert self.scheduler.retry_count(task["id"], "branch-b") == 1
+
+    def test_fail_rejects_stale_revision_without_committing_transition(self):
+        self.scheduler.enqueue(
+            {"type": "test", "revision": 7, "lifecycle_state": "running"}
+        )
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(
+            task["id"],
+            attempt_id="branch-a",
+            expected_revision=6,
+            expected_lifecycle_state="running",
+        )
+        assert self.scheduler.retry_count(task["id"], "branch-a") == 0
+        assert self.scheduler._in_flight[task["id"]] is task
+        assert (
+            self.scheduler.retry_audit_records()[-1]["reason"]
+            == "revision_mismatch"
+        )
+
+    def test_fail_rejects_lifecycle_mismatch_without_commit(self):
+        self.scheduler.enqueue(
+            {"type": "test", "revision": 3, "lifecycle_state": "completed"}
+        )
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(
+            task["id"],
+            attempt_id="branch-a",
+            expected_revision=3,
+            expected_lifecycle_state="running",
+        )
+        assert self.scheduler.retry_count(task["id"], "branch-a") == 0
+        assert self.scheduler._in_flight[task["id"]] is task
+        assert (
+            self.scheduler.retry_audit_records()[-1]["reason"]
+            == "lifecycle_mismatch"
+        )
 
 # 2019-01-09T19:07:03 update
 
