@@ -1,9 +1,10 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import hashlib
 import heapq
+import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -35,9 +36,18 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._resume_decisions: Dict[str, Dict[str, Any]] = {}
+        self._resume_audit: List[Dict[str, Any]] = []
+        self._resume_lock = threading.Lock()
+        self._max_resume_audit = 100
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +58,113 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def plan_tenant_resume(
+        self,
+        tenant_id: str,
+        backlog: List[Dict],
+        max_dispatch: int,
+        resume_token: str,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> Dict[str, Any]:
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        if not resume_token:
+            raise ValueError("resume_token is required")
+
+        decision_key = f"{tenant_id}:{resume_token}"
+        tenant_hash = hashlib.sha256(
+            tenant_id.encode("utf-8")
+        ).hexdigest()[:12]
+        backlog_count = len(backlog)
+
+        with self._resume_lock:
+            existing = self._resume_decisions.get(decision_key)
+            if existing:
+                return self._record_resume_audit(
+                    action="duplicate_rejected",
+                    tenant_hash=tenant_hash,
+                    resume_token=resume_token,
+                    released_count=0,
+                    deferred_count=backlog_count,
+                    requested_count=backlog_count,
+                    release_id=existing["release_id"],
+                    reason="resume_precondition_failed",
+                )
+
+            release_id = str(uuid4())
+            release_count = max(0, min(max_dispatch, backlog_count))
+            for task in backlog[:release_count]:
+                resumed_task = dict(task)
+                resumed_task["tenant_resume_release_id"] = release_id
+                self.enqueue(resumed_task, queue=queue, priority=priority)
+
+            decision = self._record_resume_audit(
+                action=(
+                    "resume_planned" if release_count else "resume_deferred"
+                ),
+                tenant_hash=tenant_hash,
+                resume_token=resume_token,
+                released_count=release_count,
+                deferred_count=backlog_count - release_count,
+                requested_count=backlog_count,
+                release_id=release_id,
+                reason=(
+                    "capacity_limited"
+                    if release_count < backlog_count
+                    else "released"
+                ),
+            )
+            self._resume_decisions[decision_key] = decision
+            return decision
+
+    def resume_audit(self) -> List[Dict[str, Any]]:
+        return [dict(entry) for entry in self._resume_audit]
+
+    def _record_resume_audit(
+        self,
+        action: str,
+        tenant_hash: str,
+        resume_token: str,
+        released_count: int,
+        deferred_count: int,
+        requested_count: int,
+        release_id: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        entry = {
+            "action": action,
+            "tenant_hash": tenant_hash,
+            "resume_token": resume_token,
+            "release_id": release_id,
+            "requested_count": requested_count,
+            "released_count": released_count,
+            "deferred_count": deferred_count,
+            "reason": reason,
+            "created_at": time.time(),
+        }
+        self._resume_audit.append(entry)
+        if len(self._resume_audit) > self._max_resume_audit:
+            self._resume_audit = self._resume_audit[-self._max_resume_audit:]
+        return dict(entry)
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:

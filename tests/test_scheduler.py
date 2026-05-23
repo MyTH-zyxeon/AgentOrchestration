@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,92 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_tenant_resume_limits_backlog_burst(self):
+        backlog = [
+            {"type": "tenant-job", "payload": {"index": index}}
+            for index in range(4)
+        ]
+
+        decision = self.scheduler.plan_tenant_resume(
+            tenant_id="tenant-alpha",
+            backlog=backlog,
+            max_dispatch=2,
+            resume_token="resume-1",
+            queue="tenant",
+            priority=5,
+        )
+
+        assert decision["action"] == "resume_planned"
+        assert decision["released_count"] == 2
+        assert decision["deferred_count"] == 2
+        assert "tenant-alpha" not in str(decision)
+        assert all("id" not in task for task in backlog[2:])
+
+        first = asyncio.run(self.scheduler.dequeue("tenant"))
+        second = asyncio.run(self.scheduler.dequeue("tenant"))
+        third = asyncio.run(self.scheduler.dequeue("tenant"))
+
+        assert first["payload"]["index"] == 0
+        assert second["payload"]["index"] == 1
+        assert third is None
+        assert first["tenant_resume_release_id"] == decision["release_id"]
+
+    def test_tenant_resume_rejects_duplicate_token(self):
+        backlog = [{"type": "tenant-job", "payload": {"index": 0}}]
+
+        first = self.scheduler.plan_tenant_resume(
+            tenant_id="tenant-alpha",
+            backlog=backlog,
+            max_dispatch=1,
+            resume_token="resume-1",
+        )
+        duplicate = self.scheduler.plan_tenant_resume(
+            tenant_id="tenant-alpha",
+            backlog=backlog,
+            max_dispatch=1,
+            resume_token="resume-1",
+        )
+
+        queued = asyncio.run(self.scheduler.dequeue())
+        extra = asyncio.run(self.scheduler.dequeue())
+
+        assert first["released_count"] == 1
+        assert duplicate["action"] == "duplicate_rejected"
+        assert duplicate["released_count"] == 0
+        assert duplicate["deferred_count"] == 1
+        assert duplicate["release_id"] == first["release_id"]
+        assert queued is not None
+        assert extra is None
+
+    def test_tenant_resume_audit_is_bounded(self):
+        self.scheduler._max_resume_audit = 2
+
+        for index in range(3):
+            self.scheduler.plan_tenant_resume(
+                tenant_id=f"tenant-{index}",
+                backlog=[],
+                max_dispatch=0,
+                resume_token=f"resume-{index}",
+            )
+
+        audit = self.scheduler.resume_audit()
+
+        assert len(audit) == 2
+        assert audit[0]["resume_token"] == "resume-1"
+        assert audit[1]["resume_token"] == "resume-2"
 
 # 2019-01-09T19:07:03 update
 
