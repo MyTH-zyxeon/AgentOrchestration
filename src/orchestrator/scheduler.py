@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from uuid import uuid4
 
 
@@ -35,9 +35,18 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._cron_leaders: Dict[str, Dict] = {}
+        self._cron_ticks: Dict[Tuple[str, str], Dict] = {}
+        self._cron_audit = []
+        self._state_lock = threading.RLock()
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +57,92 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def materialize_cron_tick(
+        self,
+        cron_key: str,
+        tick_id: str,
+        task: Dict,
+        leader_id: str,
+        leader_epoch: int,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> Dict[str, Any]:
+        """Accept exactly one leader-owned task for each cron tick."""
+
+        decided_at = time.time()
+        decision = {
+            "accepted": False,
+            "reason": "invalid_cron_tick",
+            "cron_key": cron_key,
+            "tick_id": tick_id,
+            "leader_id": leader_id,
+            "leader_epoch": leader_epoch,
+            "decided_at": decided_at,
+            "task_id": None,
+        }
+        if not cron_key or not tick_id or not leader_id:
+            self._record_cron_decision(decision)
+            return decision
+        if not isinstance(leader_epoch, int):
+            self._record_cron_decision(decision)
+            return decision
+
+        tick_key = (cron_key, tick_id)
+        with self._state_lock:
+            active_leader = self._cron_leaders.get(cron_key)
+            if active_leader and leader_epoch < active_leader["leader_epoch"]:
+                decision["reason"] = "stale_leader_epoch"
+                self._record_cron_decision(decision)
+                return decision
+
+            if tick_key in self._cron_ticks:
+                previous = self._cron_ticks[tick_key]
+                decision["reason"] = "duplicate_cron_tick"
+                decision["task_id"] = previous["task_id"]
+                self._record_cron_decision(decision)
+                return decision
+
+            self._cron_leaders[cron_key] = {
+                "leader_id": leader_id,
+                "leader_epoch": leader_epoch,
+                "updated_at": decided_at,
+            }
+            cron_task = dict(task)
+            cron_task["cron_key"] = cron_key
+            cron_task["cron_tick_id"] = tick_id
+            cron_task["leader_id"] = leader_id
+            cron_task["leader_epoch"] = leader_epoch
+            task_id = self.enqueue(cron_task, queue=queue, priority=priority)
+
+            decision["accepted"] = True
+            decision["reason"] = "accepted"
+            decision["task_id"] = task_id
+            self._cron_ticks[tick_key] = dict(decision)
+            self._record_cron_decision(decision)
+            return decision
+
+    def _record_cron_decision(self, decision: Dict[str, Any]) -> None:
+        self._cron_audit.append(dict(decision))
+        if len(self._cron_audit) > 100:
+            self._cron_audit.pop(0)
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:

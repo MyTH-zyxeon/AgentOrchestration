@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,84 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_materialize_cron_tick_accepts_one_leader_task(self):
+        decision = self.scheduler.materialize_cron_tick(
+            "daily-report",
+            "2026-05-23T09:00:00Z",
+            {"type": "cron"},
+            leader_id="replica-a",
+            leader_epoch=4,
+        )
+
+        assert decision["accepted"] is True
+        assert decision["reason"] == "accepted"
+
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == decision["task_id"]
+        assert task["cron_key"] == "daily-report"
+        assert task["cron_tick_id"] == "2026-05-23T09:00:00Z"
+        assert task["leader_id"] == "replica-a"
+        assert task["leader_epoch"] == 4
+
+    def test_materialize_cron_tick_rejects_duplicate_tick(self):
+        first = self.scheduler.materialize_cron_tick(
+            "daily-report",
+            "2026-05-23T09:00:00Z",
+            {"type": "cron"},
+            leader_id="replica-a",
+            leader_epoch=4,
+        )
+        duplicate = self.scheduler.materialize_cron_tick(
+            "daily-report",
+            "2026-05-23T09:00:00Z",
+            {"type": "cron"},
+            leader_id="replica-b",
+            leader_epoch=5,
+        )
+
+        assert first["accepted"] is True
+        assert duplicate["accepted"] is False
+        assert duplicate["reason"] == "duplicate_cron_tick"
+        assert duplicate["task_id"] == first["task_id"]
+
+        asyncio.run(self.scheduler.dequeue())
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_materialize_cron_tick_rejects_stale_leader_epoch(self):
+        accepted = self.scheduler.materialize_cron_tick(
+            "daily-report",
+            "2026-05-23T09:00:00Z",
+            {"type": "cron"},
+            leader_id="replica-b",
+            leader_epoch=7,
+        )
+        stale = self.scheduler.materialize_cron_tick(
+            "daily-report",
+            "2026-05-23T09:01:00Z",
+            {"type": "cron"},
+            leader_id="replica-a",
+            leader_epoch=6,
+        )
+
+        assert accepted["accepted"] is True
+        assert stale["accepted"] is False
+        assert stale["reason"] == "stale_leader_epoch"
+
+        asyncio.run(self.scheduler.dequeue())
+        assert asyncio.run(self.scheduler.dequeue()) is None
 
 # 2019-01-09T19:07:03 update
 
