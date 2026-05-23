@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import uuid4
 
 
@@ -33,34 +32,170 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
+        self._deleted_scheduled: Set[str] = set()
+        self._deleted_workflows: Set[str] = set()
         self._in_flight: Dict[str, Dict] = {}
+        self._audit_records: List[Dict[str, Any]] = []
+        self._max_audit_records = 100
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def _record_audit(
+        self,
+        event: str,
+        task_id: str,
+        queue: str,
+        reason: str = "",
+    ) -> None:
+        self._audit_records.append(
+            {
+                "event": event,
+                "task_id": task_id,
+                "queue": queue,
+                "reason": reason,
+                "timestamp": time.time(),
+            }
+        )
+        if len(self._audit_records) > self._max_audit_records:
+            self._audit_records = self._audit_records[
+                -self._max_audit_records:
+            ]
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [record.copy() for record in self._audit_records]
+
+    def _push_task(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int,
+        task_id: Optional[str] = None,
+    ) -> str:
+        workflow_id = task.get("workflow_id")
+        if workflow_id in self._deleted_workflows:
+            self._record_audit(
+                "run_creation_rejected",
+                task_id or "",
+                queue,
+                "workflow_deleted",
+            )
+            raise ValueError("cannot create a run for a deleted workflow")
+
+        task_id = task_id or str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("retries", 0)
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task["retries"] = 0
+        return self._push_task(task, queue, priority)
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        if task.get("workflow_id") in self._deleted_workflows:
+            self._record_audit(
+                "scheduled_run_rejected",
+                task_id,
+                queue,
+                "workflow_deleted",
+            )
+            raise ValueError("cannot schedule a run for a deleted workflow")
+
+        self._scheduled[task_id] = {
+            "task": task.copy(),
+            "due_at": time.time() + delay,
+            "queue": queue,
+            "priority": priority,
+            "deleted": False,
+            "delete_reason": "",
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def mark_workflow_deleted(
+        self,
+        workflow_id: str,
+        reason: str = "workflow_deleted",
+    ) -> None:
+        self._deleted_workflows.add(workflow_id)
+        for task_id, record in self._scheduled.items():
+            if record["task"].get("workflow_id") == workflow_id:
+                record["deleted"] = True
+                record["delete_reason"] = reason
+                self._deleted_scheduled.add(task_id)
+        self._record_audit(
+            "workflow_deleted",
+            workflow_id,
+            "",
+            reason,
+        )
+
+    def cancel_scheduled(
+        self,
+        task_id: str,
+        reason: str = "workflow_deleted",
+    ) -> bool:
+        record = self._scheduled.get(task_id)
+        if not record:
+            return False
+        record["deleted"] = True
+        record["delete_reason"] = reason
+        self._deleted_scheduled.add(task_id)
+        self._record_audit(
+            "scheduled_run_deleted",
+            task_id,
+            record["queue"],
+            reason,
+        )
+        return True
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid for tid, record in self._scheduled.items()
+            if record["due_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            record = self._scheduled.pop(tid)
+            workflow_id = record["task"].get("workflow_id")
+            if (
+                record["deleted"]
+                or tid in self._deleted_scheduled
+                or workflow_id in self._deleted_workflows
+            ):
+                self._record_audit(
+                    "scheduled_run_rejected",
+                    tid,
+                    record["queue"],
+                    record["delete_reason"] or "workflow_deleted",
+                )
+                continue
+            self._push_task(
+                record["task"],
+                record["queue"],
+                record["priority"],
+                task_id=tid,
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()

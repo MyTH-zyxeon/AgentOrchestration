@@ -1,4 +1,7 @@
+import asyncio
+
 import pytest
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +15,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +22,92 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_due_scheduled_task_materializes_once(self):
+        task_id = self.scheduler.schedule(
+            {"type": "workflow-run"},
+            delay=0,
+            priority=3,
+        )
+
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["type"] == "workflow-run"
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_deleted_scheduled_task_is_not_materialized(self):
+        task_id = self.scheduler.schedule(
+            {"type": "workflow-run", "payload": {"secret": "hidden"}},
+            delay=0,
+            queue="critical",
+            priority=10,
+        )
+
+        assert self.scheduler.cancel_scheduled(
+            task_id,
+            reason="workflow_removed",
+        )
+        task = asyncio.run(self.scheduler.dequeue("critical"))
+
+        assert task is None
+        records = self.scheduler.audit_records()
+        assert records[-1]["event"] == "scheduled_run_rejected"
+        assert records[-1]["task_id"] == task_id
+        assert records[-1]["queue"] == "critical"
+        assert records[-1]["reason"] == "workflow_removed"
+        assert "payload" not in records[-1]
+
+    def test_cancel_unknown_scheduled_task_is_safe(self):
+        assert not self.scheduler.cancel_scheduled("missing-task")
+
+    def test_deleted_workflow_rejects_new_run_creation(self):
+        self.scheduler.mark_workflow_deleted("workflow-1")
+
+        with pytest.raises(ValueError):
+            self.scheduler.enqueue({
+                "type": "workflow-run",
+                "workflow_id": "workflow-1",
+                "payload": {"secret": "hidden"},
+            })
+
+        records = self.scheduler.audit_records()
+        assert records[-1]["event"] == "run_creation_rejected"
+        assert records[-1]["reason"] == "workflow_deleted"
+        assert "payload" not in records[-1]
+
+    def test_deleted_workflow_rejects_scheduled_materialization(self):
+        task_id = self.scheduler.schedule(
+            {
+                "type": "workflow-run",
+                "workflow_id": "workflow-1",
+                "payload": {"secret": "hidden"},
+            },
+            delay=0,
+        )
+
+        self.scheduler.mark_workflow_deleted("workflow-1")
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task is None
+        records = self.scheduler.audit_records()
+        assert records[-1]["event"] == "scheduled_run_rejected"
+        assert records[-1]["task_id"] == task_id
+        assert records[-1]["reason"] == "workflow_deleted"
+        assert "payload" not in records[-1]
 
 # 2019-01-09T19:07:03 update
 
