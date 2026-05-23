@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, develop]
@@ -7,8 +10,16 @@ on:
     branches: [main]
 
 jobs:
+  permissions-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check workflow permissions
+        run: python .github/scripts/check_workflow_permissions.py
+
   test:
     runs-on: ubuntu-latest
+    needs: permissions-policy
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11"]
