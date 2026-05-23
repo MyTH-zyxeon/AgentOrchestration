@@ -1,5 +1,15 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
+
+
+class ManualClock:
+    def __init__(self, initial=0.0):
+        self.value = initial
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
 
 
 class TestTaskScheduler:
@@ -35,6 +45,41 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_scheduled_task_uses_monotonic_deadline(self):
+        import asyncio
+        clock = ManualClock(initial=100.0)
+        scheduler = TaskScheduler(clock=clock)
+
+        task_id = scheduler.schedule({"type": "scheduled"}, delay=5.0)
+
+        assert asyncio.run(scheduler.dequeue()) is None
+        clock.advance(5.0)
+
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["type"] == "scheduled"
+        assert task["released_at"] == 105.0
+        assert (
+            scheduler.audit_records[-1]["action"]
+            == "scheduled_task_released"
+        )
+
+    def test_heartbeat_rejects_non_monotonic_clock_transition(self):
+        clock = ManualClock(initial=100.0)
+        scheduler = TaskScheduler(clock=clock)
+
+        assert scheduler.record_heartbeat("run-1", "running")
+        clock.value = 95.0
+
+        assert not scheduler.record_heartbeat("run-1", "completed")
+        assert scheduler.heartbeat_state("run-1") == "running"
+        audit = scheduler.audit_records[-1]
+        assert audit["action"] == "heartbeat_rejected"
+        assert audit["reason"] == "non_monotonic_time"
+        assert "payload" not in audit
 
 # 2019-01-09T19:07:03 update
 
