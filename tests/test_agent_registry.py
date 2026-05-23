@@ -1,5 +1,9 @@
 import pytest
-from src.agent.registry import AgentRegistry, AgentStatus
+from src.agent.registry import (
+    AgentRegistry,
+    AgentStatus,
+    CapabilityContractError,
+)
 
 
 class TestAgentRegistry:
@@ -47,6 +51,77 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_schema_cache_rejects_stale_capability_contract(self):
+        contract = {
+            "name": "summarize",
+            "version": "1.0.0",
+            "schema": {"required": ["document_id"]},
+        }
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            capability_contract=contract,
+            schema={"properties": {"document_id": {"type": "string"}}},
+        )
+
+        assert self.registry.get_schema(agent_id) == {
+            "properties": {"document_id": {"type": "string"}}
+        }
+
+        updated_contract = {
+            "name": "summarize",
+            "version": "1.1.0",
+            "schema": {"required": ["document_id", "tenant_id"]},
+        }
+        assert self.registry.update_capability_contract(
+            agent_id,
+            updated_contract,
+        )
+
+        assert self.registry.get_schema(agent_id) is None
+        assert self.registry.get_registry_audit()[-1]["reason"] == (
+            "schema_cache_invalidated"
+        )
+
+    def test_capability_contract_rejects_version_downgrade(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            capability_contract={"name": "summarize", "version": "2.0.0"},
+            schema={"properties": {}},
+        )
+
+        with pytest.raises(CapabilityContractError):
+            self.registry.update_capability_contract(
+                agent_id, {"name": "summarize", "version": "1.9.0"}
+            )
+
+        assert self.registry.get_schema(agent_id) == {"properties": {}}
+
+    def test_capability_contract_rejects_required_field_removal(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            capability_contract={
+                "name": "summarize",
+                "version": "1.0.0",
+                "schema": {"required": ["document_id", "tenant_id"]},
+            },
+            schema={"properties": {"document_id": {"type": "string"}}},
+        )
+
+        with pytest.raises(CapabilityContractError):
+            self.registry.update_capability_contract(
+                agent_id,
+                {
+                    "name": "summarize",
+                    "version": "1.1.0",
+                    "schema": {"required": ["document_id"]},
+                },
+            )
+
+        assert self.registry.get_schema(agent_id) is not None
 
 # 2019-01-23T10:28:57 update
 
