@@ -1,18 +1,173 @@
 """API middleware components."""
 
+import re
 import time
 import logging
-from typing import Callable
+from contextvars import ContextVar
+from typing import Callable, Optional
+from uuid import uuid4
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+_SAFE_CONTEXT_VALUE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,128}$")
+
+correlation_id_var: ContextVar[Optional[str]] = ContextVar(
+    "correlation_id",
+    default=None,
+)
+request_id_var: ContextVar[Optional[str]] = ContextVar(
+    "request_id",
+    default=None,
+)
+workspace_id_var: ContextVar[Optional[str]] = ContextVar(
+    "workspace_id",
+    default=None,
+)
+active_role_var: ContextVar[Optional[str]] = ContextVar(
+    "active_role",
+    default=None,
+)
+
+
+def get_correlation_id() -> Optional[str]:
+    return correlation_id_var.get()
+
+
+def get_request_id() -> Optional[str]:
+    return request_id_var.get()
+
+
+def get_workspace_id() -> Optional[str]:
+    return workspace_id_var.get()
+
+
+def get_active_role() -> Optional[str]:
+    return active_role_var.get()
+
+
+def _safe_context_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value or not _SAFE_CONTEXT_VALUE.fullmatch(value):
+        return None
+    return value
+
+
+def _scope_or_state_value(
+    request: Request,
+    scope_name: str,
+    state_name: str,
+) -> Optional[str]:
+    value = request.scope.get(scope_name)
+    if value is None:
+        value = request.scope.get(state_name)
+    if value is None:
+        value = getattr(request.state, state_name, None)
+    return _safe_context_value(str(value)) if value is not None else None
+
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        correlation_id = (
+            _safe_context_value(request.headers.get("x-correlation-id"))
+            or uuid4().hex
+        )
+        request_id = (
+            _safe_context_value(request.headers.get("x-request-id"))
+            or uuid4().hex
+        )
+
+        header_workspace = _safe_context_value(
+            request.headers.get("x-workspace-id"),
+        )
+        header_role = _safe_context_value(request.headers.get("x-role"))
+        authenticated_workspace = _scope_or_state_value(
+            request,
+            "auth_workspace_id",
+            "workspace_id",
+        )
+        authenticated_role = _scope_or_state_value(
+            request,
+            "auth_role",
+            "active_role",
+        )
+
+        if (
+            authenticated_workspace
+            and header_workspace
+            and authenticated_workspace != header_workspace
+        ):
+            return self._rejected(
+                correlation_id,
+                request_id,
+                "Workspace context mismatch",
+            )
+        if (
+            authenticated_role
+            and header_role
+            and authenticated_role != header_role
+        ):
+            return self._rejected(
+                correlation_id,
+                request_id,
+                "Role context mismatch",
+            )
+
+        workspace_id = authenticated_workspace or header_workspace
+        active_role = authenticated_role or header_role
+
+        tokens = (
+            correlation_id_var.set(correlation_id),
+            request_id_var.set(request_id),
+            workspace_id_var.set(workspace_id),
+            active_role_var.set(active_role),
+        )
+        try:
+            response = await call_next(request)
+            response.headers["x-correlation-id"] = correlation_id
+            response.headers["x-request-id"] = request_id
+            return response
+        finally:
+            correlation_id_var.reset(tokens[0])
+            request_id_var.reset(tokens[1])
+            workspace_id_var.reset(tokens[2])
+            active_role_var.reset(tokens[3])
+
+    @staticmethod
+    def _rejected(
+        correlation_id: str,
+        request_id: str,
+        reason: str,
+    ) -> Response:
+        return Response(
+            status_code=403,
+            content=reason,
+            headers={
+                "x-correlation-id": correlation_id,
+                "x-request-id": request_id,
+            },
+        )
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +181,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +204,23 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        correlation_id = get_correlation_id() or "-"
+        logger.info(
+            "%s %s %s %s %.3fs",
+            correlation_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
