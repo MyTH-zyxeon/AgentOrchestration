@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,49 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_initial_data_is_owned_by_config(self):
+        source = {
+            "app": {
+                "features": ["agents"],
+                "limits": {"cpu_time": 30},
+            },
+        }
+        config = Config(initial_data=source)
+
+        source["app"]["features"].append("external")
+        source["app"]["limits"]["cpu_time"] = 1
+
+        assert config.get("app.features") == ["agents"]
+        assert config.get("app.limits.cpu_time") == 30
+
+    def test_load_dict_replaces_state_with_owned_copy(self):
+        source = {"database": {"hosts": ["primary"]}}
+        config = Config()
+        config.load_dict(source)
+
+        source["database"]["hosts"].append("replica")
+
+        assert config.get("database.hosts") == ["primary"]
+
+    def test_set_and_get_do_not_share_nested_state(self):
+        value = {"thresholds": [10, 20]}
+        config = Config()
+        config.set("limits.sandbox", value)
+
+        value["thresholds"].append(30)
+        returned = config.get("limits.sandbox")
+        returned["thresholds"].append(40)
+
+        assert config.get("limits.sandbox.thresholds") == [10, 20]
+
+    def test_to_dict_returns_isolated_copy(self):
+        config = Config(initial_data={"audit": {"enabled": True}})
+        data = config.to_dict()
+
+        data["audit"]["enabled"] = False
+
+        assert config.get("audit.enabled") is True
 
 # 2019-02-01T18:58:35 update
 
