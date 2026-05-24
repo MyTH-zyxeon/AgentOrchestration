@@ -1,10 +1,18 @@
 """Orchestration engine module."""
 
 from .engine import OrchestrationEngine
+from .reducer import OrchestratorReducer, ReducerErrorStore, ReducerState
 from .scheduler import TaskScheduler
 from .workflow import WorkflowManager
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "OrchestrationEngine",
+    "OrchestratorReducer",
+    "ReducerErrorStore",
+    "ReducerState",
+    "TaskScheduler",
+    "WorkflowManager",
+]
 
 # 2019-07-01T16:04:27 update
 
