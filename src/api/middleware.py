@@ -1,7 +1,8 @@
 """API middleware components."""
 
-import time
 import logging
+import re
+import time
 from typing import Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -10,9 +11,45 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+def collapse_duplicate_slashes(path: str) -> str:
+    """Collapse repeated slashes in a URL path without changing query data."""
+    return re.sub(r"/{2,}", "/", path)
+
+
+class PathNormalizationMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
+        original_path = request.scope.get("path", "")
+        normalized_path = collapse_duplicate_slashes(original_path)
+        was_normalized = normalized_path != original_path
+
+        if was_normalized:
+            request.scope["path"] = normalized_path
+            request.scope["raw_path"] = normalized_path.encode("utf-8")
+            request.state.path_normalized = True
+            logger.info(
+                "Collapsed duplicate path slashes before route handling"
+            )
+
+        try:
+            response = await call_next(request)
+            if was_normalized:
+                response.headers["X-AO-Path-Normalized"] = "true"
+            return response
+        finally:
+            if hasattr(request.state, "path_normalized"):
+                delattr(request.state, "path_normalized")
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
+        is_api = request.url.path.startswith("/api/v2")
+        is_token_route = request.url.path == "/api/v2/auth/token"
+
+        if is_api and not is_token_route:
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +63,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            timestamp
+            for timestamp in self._requests[client_ip]
+            if now - timestamp < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +86,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
