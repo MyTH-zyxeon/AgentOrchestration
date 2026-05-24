@@ -21,6 +21,9 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._generation = 0
+        self._resolutions: Dict[str, Dict[str, Any]] = {}
+        self._audit_records: List[Dict[str, Any]] = []
 
     def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
         agent_id = str(uuid.uuid4())
@@ -40,6 +43,7 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._generation += 1
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
@@ -59,6 +63,7 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        self._generation += 1
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +73,95 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._generation += 1
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def resolve_handler(self, attempt_id: str, agent_type: str) -> Optional[Dict[str, Any]]:
+        resolution = self._resolutions.get(attempt_id)
+        if resolution:
+            agent = self._agents.get(resolution["agent_id"])
+            if not self._can_run(agent, resolution["agent_type"]):
+                self._record_resolution_decision(
+                    attempt_id,
+                    "deferred",
+                    resolution.get("agent_id"),
+                    resolution.get("agent_type"),
+                    "pinned handler unavailable after registry update",
+                )
+                return None
+            self._record_resolution_decision(
+                attempt_id,
+                "pinned",
+                resolution["agent_id"],
+                resolution["agent_type"],
+                "reused pinned handler",
+            )
+            return dict(agent)
+
+        agent = self._find_handler(agent_type)
+        if not agent:
+            self._record_resolution_decision(
+                attempt_id,
+                "rejected",
+                None,
+                agent_type,
+                "no available handler",
+            )
+            return None
+
+        self._resolutions[attempt_id] = {
+            "agent_id": agent["id"],
+            "agent_type": agent["type"],
+            "generation": self._generation,
+            "created_at": time.time(),
+        }
+        self._record_resolution_decision(
+            attempt_id,
+            "resolved",
+            agent["id"],
+            agent["type"],
+            "handler pinned for attempt",
+        )
+        return dict(agent)
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
+
+    def _find_handler(self, agent_type: str) -> Optional[Dict[str, Any]]:
+        for agent in self._agents.values():
+            if self._can_run(agent, agent_type):
+                return agent
+        return None
+
+    def _can_run(self, agent: Optional[Dict[str, Any]], agent_type: str) -> bool:
+        if not agent or agent.get("type") != agent_type:
+            return False
+        return agent.get("status") not in {
+            AgentStatus.STOPPED.value,
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }
+
+    def _record_resolution_decision(
+        self,
+        attempt_id: str,
+        decision: str,
+        agent_id: Optional[str],
+        agent_type: Optional[str],
+        reason: str,
+    ) -> None:
+        self._audit_records.append({
+            "attempt_id": attempt_id,
+            "decision": decision,
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "generation": self._generation,
+            "reason": reason,
+            "timestamp": time.time(),
+        })
 
 # 2019-01-29T11:24:49 update
 

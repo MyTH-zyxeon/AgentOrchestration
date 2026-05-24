@@ -48,6 +48,38 @@ class TestAgentRegistry:
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
 
+    def test_resolve_handler_pins_agent_per_attempt(self):
+        first_agent = self.registry.register("agent-1", "worker.processor")
+        resolved = self.registry.resolve_handler("attempt-1", "worker.processor")
+
+        self.registry.register("agent-2", "worker.processor")
+        resolved_again = self.registry.resolve_handler("attempt-1", "worker.processor")
+
+        assert resolved["id"] == first_agent
+        assert resolved_again["id"] == first_agent
+        assert self.registry.audit_records()[-1]["decision"] == "pinned"
+
+    def test_resolve_handler_defers_when_pinned_agent_stops_mid_run(self):
+        agent_id = self.registry.register("agent-1", "worker.processor")
+        assert self.registry.resolve_handler("attempt-1", "worker.processor")["id"] == agent_id
+
+        assert self.registry.update_status(agent_id, AgentStatus.STOPPED)
+
+        assert self.registry.resolve_handler("attempt-1", "worker.processor") is None
+        record = self.registry.audit_records()[-1]
+        assert record["decision"] == "deferred"
+        assert record["reason"] == "pinned handler unavailable after registry update"
+
+    def test_registry_update_does_not_reroute_existing_attempt(self):
+        first_agent = self.registry.register("agent-1", "worker.processor")
+        assert self.registry.resolve_handler("attempt-1", "worker.processor")["id"] == first_agent
+
+        assert self.registry.delete(first_agent)
+        second_agent = self.registry.register("agent-2", "worker.processor")
+
+        assert self.registry.resolve_handler("attempt-1", "worker.processor") is None
+        assert self.registry.resolve_handler("attempt-2", "worker.processor")["id"] == second_agent
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update
