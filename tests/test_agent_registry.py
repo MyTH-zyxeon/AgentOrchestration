@@ -65,10 +65,11 @@ class TestAgentRegistry:
 
         assert self.registry.update_status(agent_id, AgentStatus.STOPPED)
 
+        assert self.registry.audit_records()[-1]["decision"] == "invalidated"
         assert self.registry.resolve_handler("attempt-1", "worker.processor") is None
         record = self.registry.audit_records()[-1]
         assert record["decision"] == "deferred"
-        assert record["reason"] == "pinned handler unavailable after registry update"
+        assert record["reason"] == "handler status changed to stopped"
 
     def test_registry_update_does_not_reroute_existing_attempt(self):
         first_agent = self.registry.register("agent-1", "worker.processor")
@@ -79,6 +80,17 @@ class TestAgentRegistry:
 
         assert self.registry.resolve_handler("attempt-1", "worker.processor") is None
         assert self.registry.resolve_handler("attempt-2", "worker.processor")["id"] == second_agent
+
+    def test_paused_handler_invalidates_existing_attempt(self):
+        agent_id = self.registry.register("agent-1", "worker.processor")
+        assert self.registry.resolve_handler("attempt-1", "worker.processor")["id"] == agent_id
+
+        assert self.registry.update_status(agent_id, AgentStatus.PAUSED)
+
+        assert self.registry.resolve_handler("attempt-1", "worker.processor") is None
+        record = self.registry.audit_records()[-1]
+        assert record["decision"] == "deferred"
+        assert record["reason"] == "handler status changed to paused"
 
 # 2019-01-23T10:28:57 update
 

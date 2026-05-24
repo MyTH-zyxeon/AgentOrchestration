@@ -64,6 +64,13 @@ class AgentRegistry:
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
         self._generation += 1
+        if status in {
+            AgentStatus.PAUSED,
+            AgentStatus.STOPPED,
+            AgentStatus.FAILED,
+            AgentStatus.TERMINATED,
+        }:
+            self._invalidate_resolutions(agent_id, f"handler status changed to {status.value}")
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -74,6 +81,7 @@ class AgentRegistry:
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
         self._generation += 1
+        self._invalidate_resolutions(agent_id, "handler removed from registry")
         return True
 
     def count(self) -> int:
@@ -82,6 +90,15 @@ class AgentRegistry:
     def resolve_handler(self, attempt_id: str, agent_type: str) -> Optional[Dict[str, Any]]:
         resolution = self._resolutions.get(attempt_id)
         if resolution:
+            if resolution.get("invalidated"):
+                self._record_resolution_decision(
+                    attempt_id,
+                    "deferred",
+                    resolution.get("agent_id"),
+                    resolution.get("agent_type"),
+                    resolution.get("invalidated_reason") or "pinned handler invalidated",
+                )
+                return None
             agent = self._agents.get(resolution["agent_id"])
             if not self._can_run(agent, resolution["agent_type"]):
                 self._record_resolution_decision(
@@ -117,6 +134,7 @@ class AgentRegistry:
             "agent_type": agent["type"],
             "generation": self._generation,
             "created_at": time.time(),
+            "invalidated": False,
         }
         self._record_resolution_decision(
             attempt_id,
@@ -140,10 +158,26 @@ class AgentRegistry:
         if not agent or agent.get("type") != agent_type:
             return False
         return agent.get("status") not in {
+            AgentStatus.PAUSED.value,
             AgentStatus.STOPPED.value,
             AgentStatus.FAILED.value,
             AgentStatus.TERMINATED.value,
         }
+
+    def _invalidate_resolutions(self, agent_id: str, reason: str) -> None:
+        for attempt_id, resolution in self._resolutions.items():
+            if resolution.get("agent_id") != agent_id or resolution.get("invalidated"):
+                continue
+            resolution["invalidated"] = True
+            resolution["invalidated_reason"] = reason
+            resolution["invalidated_at"] = time.time()
+            self._record_resolution_decision(
+                attempt_id,
+                "invalidated",
+                resolution.get("agent_id"),
+                resolution.get("agent_type"),
+                reason,
+            )
 
     def _record_resolution_decision(
         self,
