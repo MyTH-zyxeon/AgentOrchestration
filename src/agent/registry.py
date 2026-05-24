@@ -87,7 +87,12 @@ class AgentRegistry:
     def count(self) -> int:
         return len(self._agents)
 
-    def resolve_handler(self, attempt_id: str, agent_type: str) -> Optional[Dict[str, Any]]:
+    def resolve_handler(
+        self,
+        attempt_id: str,
+        agent_type: str,
+        preferred_agent_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         resolution = self._resolutions.get(attempt_id)
         if resolution:
             if resolution.get("invalidated"):
@@ -118,7 +123,7 @@ class AgentRegistry:
             )
             return dict(agent)
 
-        agent = self._find_handler(agent_type)
+        agent = self._find_handler(agent_type, preferred_agent_id=preferred_agent_id)
         if not agent:
             self._record_resolution_decision(
                 attempt_id,
@@ -148,7 +153,14 @@ class AgentRegistry:
     def audit_records(self) -> List[Dict[str, Any]]:
         return list(self._audit_records)
 
-    def _find_handler(self, agent_type: str) -> Optional[Dict[str, Any]]:
+    def _find_handler(
+        self,
+        agent_type: str,
+        preferred_agent_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if preferred_agent_id:
+            agent = self._agents.get(preferred_agent_id)
+            return agent if self._can_run(agent, agent_type) else None
         for agent in self._agents.values():
             if self._can_run(agent, agent_type):
                 return agent

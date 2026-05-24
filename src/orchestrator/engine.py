@@ -54,6 +54,13 @@ class OrchestrationEngine:
             agent = self.registry.get(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
+            agent = self.registry.resolve_handler(
+                task.get("attempt_id", task_id),
+                task.get("agent_type", agent["type"]),
+                preferred_agent_id=agent_id,
+            )
+            if not agent:
+                raise ValueError(f"Agent {agent_id} is not available for task {task_id}")
 
             self.registry.update_status(agent_id, AgentStatus.RUNNING)
             result = await asyncio.wait_for(

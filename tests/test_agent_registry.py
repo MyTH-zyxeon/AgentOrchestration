@@ -92,6 +92,19 @@ class TestAgentRegistry:
         assert record["decision"] == "deferred"
         assert record["reason"] == "handler status changed to paused"
 
+    def test_resolve_handler_honors_preferred_agent(self):
+        first_agent = self.registry.register("agent-1", "worker.processor")
+        second_agent = self.registry.register("agent-2", "worker.processor")
+
+        resolved = self.registry.resolve_handler(
+            "attempt-1",
+            "worker.processor",
+            preferred_agent_id=second_agent,
+        )
+
+        assert resolved["id"] == second_agent
+        assert resolved["id"] != first_agent
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update
