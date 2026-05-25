@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -31,31 +30,64 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        lease_ttl: float = 30.0,
+        artifact_upload_timeout: float = 300.0,
+        time_fn: Callable[[], float] = time.time,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._leases: Dict[str, float] = {}
+        self._artifact_uploads: Dict[str, Dict[str, float]] = {}
+        self._lease_ttl = lease_ttl
+        self._artifact_upload_timeout = artifact_upload_timeout
+        self._time = time_fn
+        self._metrics = {
+            "artifact_uploads_started": 0,
+            "lease_renewals": 0,
+            "upload_timeouts": 0,
+        }
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
+        task["enqueued_at"] = self._time()
         task["retries"] = 0
+        self._queue_existing_task(task, queue, priority)
+        return task_id
 
+    def _queue_existing_task(
+        self, task: Dict, queue: str = "default", priority: int = 0
+    ) -> None:
+        task["queue"] = queue
+        task["priority"] = priority
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        self._scheduled[task_id] = self._time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
+    async def dequeue(
+        self, queue: str = "default", timeout: float = 1.0
+    ) -> Optional[Dict]:
+        self.recover_expired_uploads(queue)
+
+        now = self._time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
             task = self._scheduled.pop(tid)
@@ -66,20 +98,117 @@ class TaskScheduler:
             task = self._queues[queue].pop()
             if task:
                 self._in_flight[task["id"]] = task
+                self.renew_lease(task["id"])
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        self._leases.pop(task_id, None)
+        self._artifact_uploads.pop(task_id, None)
+        return task is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
+        self._leases.pop(task_id, None)
+        self._artifact_uploads.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._queue_existing_task(
+                    task, queue, priority=task.get("priority", 0)
+                )
                 return True
         return False
+
+    def begin_artifact_upload(
+        self,
+        task_id: str,
+        lease_ttl: Optional[float] = None,
+        upload_timeout: Optional[float] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            return False
+
+        now = self._time()
+        timeout = upload_timeout or self._artifact_upload_timeout
+        task["artifact_upload_state"] = "uploading"
+        task["artifact_upload_started_at"] = now
+        task["artifact_upload_expires_at"] = now + timeout
+        self._artifact_uploads[task_id] = {
+            "started_at": now,
+            "expires_at": now + timeout,
+        }
+        self._metrics["artifact_uploads_started"] += 1
+        return self.renew_lease(task_id, lease_ttl)
+
+    def finish_artifact_upload(self, task_id: str) -> bool:
+        task = self._in_flight.get(task_id)
+        if task_id not in self._artifact_uploads or not task:
+            return False
+        self._artifact_uploads.pop(task_id, None)
+        task["artifact_upload_state"] = "uploaded"
+        return True
+
+    def renew_artifact_upload_lease(
+        self, task_id: str, lease_ttl: Optional[float] = None
+    ) -> bool:
+        if task_id not in self._artifact_uploads:
+            return False
+        return self.renew_lease(task_id, lease_ttl)
+
+    def renew_lease(
+        self, task_id: str, lease_ttl: Optional[float] = None
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            return False
+        expires_at = self._time() + (lease_ttl or self._lease_ttl)
+        self._leases[task_id] = expires_at
+        task["lease_expires_at"] = expires_at
+        self._metrics["lease_renewals"] += 1
+        return True
+
+    def recover_expired_uploads(self, queue: str = "default") -> List[str]:
+        now = self._time()
+        recovered: List[str] = []
+        for task_id, lease_expires_at in list(self._leases.items()):
+            if lease_expires_at > now:
+                continue
+
+            task = self._in_flight.get(task_id)
+            if not task:
+                self._leases.pop(task_id, None)
+                continue
+
+            upload = self._artifact_uploads.get(task_id)
+            if upload and upload["expires_at"] > now:
+                self.renew_lease(task_id)
+                continue
+
+            self._in_flight.pop(task_id, None)
+            self._leases.pop(task_id, None)
+            self._artifact_uploads.pop(task_id, None)
+            task["retries"] = task.get("retries", 0) + 1
+            if upload:
+                task["artifact_upload_state"] = "expired"
+                task["artifact_upload_recovered_at"] = now
+                self._metrics["upload_timeouts"] += 1
+            if task["retries"] < self._max_retries:
+                self._queue_existing_task(
+                    task,
+                    task.get("queue", queue),
+                    priority=task.get("priority", 0),
+                )
+                recovered.append(task_id)
+        return recovered
+
+    def lease_metrics(self) -> Dict[str, int]:
+        return dict(self._metrics)
+
+    def in_flight_count(self) -> int:
+        return len(self._in_flight)
 
 # 2019-04-25T08:37:12 update
 

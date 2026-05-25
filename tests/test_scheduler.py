@@ -1,5 +1,15 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 class TestTaskScheduler:
@@ -35,6 +45,66 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_artifact_upload_extends_lease_and_prevents_duplicate(
+        self,
+    ):
+        import asyncio
+        clock = FakeClock()
+        scheduler = TaskScheduler(
+            lease_ttl=5,
+            artifact_upload_timeout=30,
+            time_fn=clock,
+        )
+        scheduler.enqueue({"type": "upload"})
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.begin_artifact_upload(task["id"], lease_ttl=20)
+        clock.advance(6)
+
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert scheduler.in_flight_count() == 1
+        assert scheduler.lease_metrics()["lease_renewals"] == 2
+
+    def test_artifact_upload_auto_renews_expired_lease(self):
+        import asyncio
+        clock = FakeClock()
+        scheduler = TaskScheduler(
+            lease_ttl=5,
+            artifact_upload_timeout=30,
+            time_fn=clock,
+        )
+        scheduler.enqueue({"type": "upload"})
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.begin_artifact_upload(task["id"], lease_ttl=2)
+        clock.advance(3)
+
+        assert asyncio.run(scheduler.dequeue()) is None
+        assert scheduler.in_flight_count() == 1
+        assert scheduler.lease_metrics()["lease_renewals"] == 3
+
+    def test_expired_artifact_upload_is_recovered_for_retry(self):
+        import asyncio
+        clock = FakeClock()
+        scheduler = TaskScheduler(
+            lease_ttl=2,
+            artifact_upload_timeout=4,
+            time_fn=clock,
+        )
+        scheduler.enqueue({"type": "upload"})
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.begin_artifact_upload(
+            task["id"], lease_ttl=2, upload_timeout=4
+        )
+        clock.advance(5)
+        retried = asyncio.run(scheduler.dequeue())
+
+        assert retried["id"] == task["id"]
+        assert retried["retries"] == 1
+        assert retried["artifact_upload_state"] == "expired"
+        assert scheduler.lease_metrics()["upload_timeouts"] == 1
 
 # 2019-01-09T19:07:03 update
 

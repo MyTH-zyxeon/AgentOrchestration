@@ -51,6 +51,16 @@ ao status --watch
 
 Full documentation at [docs.agent-orchestrator.io](https://docs.agent-orchestrator.io)
 
+## Artifact Upload Lease Recovery
+
+Workers that need to upload large artifacts should call
+`TaskScheduler.begin_artifact_upload(task_id)` before starting the upload and
+`TaskScheduler.finish_artifact_upload(task_id)` before completing the task. The
+scheduler renews leases while the upload is in progress so another worker does
+not pick up the same task. If an upload exceeds its timeout, the scheduler marks
+the upload as expired, increments `upload_timeouts`, and requeues the original
+task id for the normal retry path.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
