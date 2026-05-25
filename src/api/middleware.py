@@ -2,17 +2,99 @@
 
 import time
 import logging
+from contextvars import ContextVar
 from typing import Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
+SSE_MEDIA_TYPE = "text/event-stream"
+SSE_COMPRESSION_POLICY_HEADER = "X-Compression-Policy"
+_sse_compression_policy = ContextVar("sse_compression_policy", default=None)
+
+
+def current_sse_compression_policy():
+    return _sse_compression_policy.get()
+
+
+def _header_contains(value: str, expected: str) -> bool:
+    values = [part.strip().split(";")[0] for part in value.split(",")]
+    return expected in values
+
+
+def _accepts_event_stream(request: Request) -> bool:
+    return _header_contains(request.headers.get("accept", ""), SSE_MEDIA_TYPE)
+
+
+def _is_event_stream_response(response: Response) -> bool:
+    return _header_contains(
+        response.headers.get("content-type", ""),
+        SSE_MEDIA_TYPE,
+    )
+
+
+class SSECompressionMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        is_event_stream = _accepts_event_stream(request)
+        token = None
+        if is_event_stream:
+            token = _sse_compression_policy.set(
+                {"path": request.url.path, "compression_disabled": True}
+            )
+            request.state.disable_response_compression = True
+
+        try:
+            response = await call_next(request)
+            if is_event_stream or _is_event_stream_response(response):
+                return self._guard_event_stream_response(response)
+            return response
+        except Exception:
+            logger.warning("sse compression guard failed before response")
+            raise
+        finally:
+            if token is not None:
+                _sse_compression_policy.reset(token)
+                if hasattr(request.state, "disable_response_compression"):
+                    delattr(request.state, "disable_response_compression")
+
+    def _guard_event_stream_response(self, response: Response) -> Response:
+        encoding = response.headers.get("content-encoding", "").lower()
+        if encoding and encoding != "identity":
+            logger.info("rejected compressed event-stream response")
+            return Response(
+                status_code=406,
+                content="Compression disabled for event streams",
+                headers={
+                    "Cache-Control": "no-transform",
+                    SSE_COMPRESSION_POLICY_HEADER: "rejected-compressed-sse",
+                    "Vary": "Accept",
+                },
+            )
+
+        response.headers["Cache-Control"] = "no-transform"
+        response.headers["X-Accel-Buffering"] = "no"
+        response.headers[SSE_COMPRESSION_POLICY_HEADER] = (
+            "disabled-for-event-stream"
+        )
+        response.headers["Vary"] = "Accept"
+        return response
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +108,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +132,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
