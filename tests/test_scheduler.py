@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,41 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_fail_preserves_retry_state_without_aliasing(self):
+        metadata = {"errors": ["boom"]}
+        self.scheduler.enqueue(
+            {"type": "test", "metadata": metadata},
+            priority=7,
+        )
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        retry = asyncio.run(self.scheduler.dequeue())
+
+        assert retry["id"] == task["id"]
+        assert retry["priority"] == 7
+        assert retry["retries"] == 1
+        assert retry["metadata"] == metadata
+        assert retry["metadata"] is not metadata
+        assert retry["metadata"]["errors"] is not metadata["errors"]
+
+    def test_fail_exhausts_retries_without_resetting_retry_metadata(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["retries"] == 1
+
+        assert self.scheduler.fail(task["id"])
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["retries"] == 2
+
+        assert not self.scheduler.fail(task["id"])
+        assert asyncio.run(self.scheduler.dequeue()) is None
 
 # 2019-01-09T19:07:03 update
 

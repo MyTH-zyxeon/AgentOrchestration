@@ -1,10 +1,14 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import logging
 import time
+from copy import deepcopy
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -31,36 +35,66 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, max_retries: int = 3):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
-        self._max_retries = 3
+        self._max_retries = max_retries
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+        *,
+        preserve_retry_state: bool = False,
+    ) -> str:
+        task_id = task.get("id") if preserve_retry_state else None
+        task_id = task_id or str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["priority"] = priority
+        if preserve_retry_state:
+            task["retries"] = int(task.get("retries", 0))
+            if isinstance(task.get("metadata"), dict):
+                task["metadata"] = deepcopy(task["metadata"])
+        else:
+            task["retries"] = 0
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
+        task["priority"] = priority
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
             task = self._scheduled.pop(tid)
             if task:
-                self.enqueue(task, queue)
+                self.enqueue(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                    preserve_retry_state=True,
+                )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -74,12 +108,32 @@ class TaskScheduler:
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+        if not task:
+            logger.debug("Ignoring failure for unknown task %s", task_id)
+            return False
+
+        task["retries"] = int(task.get("retries", 0)) + 1
+        if task["retries"] >= self._max_retries:
+            logger.warning(
+                "Task %s exhausted retries at %s attempts",
+                task_id,
+                task["retries"],
+            )
+            return False
+
+        self.enqueue(
+            task,
+            queue,
+            priority=task.get("priority", 0),
+            preserve_retry_state=True,
+        )
+        logger.info(
+            "Task %s requeued for retry %s/%s",
+            task_id,
+            task["retries"],
+            self._max_retries,
+        )
+        return True
 
 # 2019-04-25T08:37:12 update
 
