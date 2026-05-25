@@ -1,22 +1,48 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from typing import Dict, Optional
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.identity_lifecycle import (
+    DeprovisionedIdentityError,
+    IdentityLifecycleStore,
+    TokenRefreshError,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+identity_lifecycle = IdentityLifecycleStore()
+
+
+class TokenRefreshRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1)
+    current_token: str = Field(..., min_length=1)
+    new_token: str = Field(..., min_length=1)
+
+
+class ScimDeprovisionRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +79,28 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/auth/token/refresh")
+async def refresh_api_token(request: TokenRefreshRequest):
+    try:
+        token = identity_lifecycle.refresh_api_token(
+            request.user_id,
+            request.session_id,
+            request.current_token,
+            request.new_token,
+        )
+    except DeprovisionedIdentityError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except TokenRefreshError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    return {"token": token}
+
+
+@router.post("/scim/users/deprovision")
+async def scim_deprovision_user(request: ScimDeprovisionRequest):
+    result = identity_lifecycle.apply_scim_deprovision(request.user_id)
+    return result.to_dict()
 
 # 2019-03-18T11:10:18 update
 
