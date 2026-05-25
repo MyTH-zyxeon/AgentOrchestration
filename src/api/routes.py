@@ -1,22 +1,42 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from typing import Dict, Optional
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.email_verification import (
+    DuplicateVerifiedEmailError,
+    EmailVerificationStore,
+    InvalidEmailAddressError,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+email_verification = EmailVerificationStore()
+
+
+class EmailVerificationRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    email: str = Field(..., min_length=1)
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +73,20 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/auth/email/verify")
+async def verify_email_claim(request: EmailVerificationRequest):
+    try:
+        result = email_verification.verify_email_claim(
+            request.user_id,
+            request.email,
+        )
+    except InvalidEmailAddressError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except DuplicateVerifiedEmailError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return result.to_dict()
 
 # 2019-03-18T11:10:18 update
 
