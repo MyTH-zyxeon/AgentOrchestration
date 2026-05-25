@@ -11,13 +11,27 @@ from src.orchestrator.scheduler import TaskScheduler
 logger = logging.getLogger(__name__)
 
 
+class DelegationDepthError(RuntimeError):
+    """Raised when a task would exceed recursive delegation limits."""
+
+
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        max_delegation_depth: int = 8,
+    ):
+        if max_delegation_depth < 1:
+            raise ValueError("max_delegation_depth must be at least 1")
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
+        self.max_delegation_depth = max_delegation_depth
         self._running = False
+        self._task_outcomes: Dict[str, Dict[str, Any]] = {}
+        self._transition_log: List[Dict[str, Any]] = []
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
             "post_execute": [],
@@ -47,10 +61,30 @@ class OrchestrationEngine:
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
-        for hook in self._hooks["pre_execute"]:
-            await hook(task)
+        if self._terminal_outcome(task_id):
+            self._record_transition(
+                task_id,
+                "duplicate_ignored",
+                self._task_outcomes[task_id]["status"],
+            )
+            return
 
         try:
+            self._reserve_delegation(task)
+        except DelegationDepthError as e:
+            if not self._terminal_outcome(task_id):
+                reason = "invalid_delegation_depth"
+                self._record_outcome(task_id, "rejected", reason=reason)
+                self._record_transition(task_id, "rejected", reason)
+            logger.warning(f"Task {task_id} rejected: {e}")
+            for hook in self._hooks["on_error"]:
+                await hook(task, e)
+            return
+
+        try:
+            for hook in self._hooks["pre_execute"]:
+                await hook(task)
+
             agent = self.registry.get(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -62,12 +96,14 @@ class OrchestrationEngine:
             )
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
 
+            self._record_outcome(task_id, "completed")
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
             logger.info(f"Task {task_id} completed successfully")
 
         except Exception as e:
+            self._record_outcome(task_id, "failed", reason=str(e))
             logger.error(f"Task {task_id} failed: {e}")
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
@@ -82,7 +118,84 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
+
+    def get_task_outcome(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return self._task_outcomes.get(task_id)
+
+    def list_transitions(self) -> List[Dict[str, Any]]:
+        return list(self._transition_log)
+
+    def _terminal_outcome(self, task_id: str) -> bool:
+        outcome = self._task_outcomes.get(task_id)
+        return bool(outcome and outcome["status"] in {
+            "completed",
+            "failed",
+            "rejected",
+        })
+
+    def _reserve_delegation(self, task: Dict[str, Any]) -> None:
+        task_id = task["id"]
+        depth = self._parse_delegation_depth(task.get("delegation_depth", 0))
+        task["delegation_depth"] = depth
+        task["max_delegation_depth"] = self.max_delegation_depth
+
+        if depth >= self.max_delegation_depth:
+            reason = "delegation_depth_exceeded"
+            self._record_outcome(task_id, "rejected", reason=reason)
+            self._record_transition(task_id, "rejected", reason, depth)
+            raise DelegationDepthError(
+                f"delegation depth {depth} exceeds limit "
+                f"{self.max_delegation_depth}"
+            )
+
+        self._record_transition(
+            task_id,
+            "delegation_reserved",
+            "within_limit",
+            depth,
+        )
+
+    def _parse_delegation_depth(self, depth: Any) -> int:
+        try:
+            parsed = int(depth)
+        except (TypeError, ValueError):
+            parsed = -1
+
+        if parsed < 0:
+            raise DelegationDepthError("delegation depth must be non-negative")
+        return parsed
+
+    def _record_outcome(
+        self,
+        task_id: str,
+        status: str,
+        reason: str = "",
+    ) -> None:
+        self._task_outcomes[task_id] = {
+            "task_id": task_id,
+            "status": status,
+            "reason": reason,
+        }
+
+    def _record_transition(
+        self,
+        task_id: str,
+        decision: str,
+        reason: str,
+        depth: Optional[int] = None,
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "task_id": task_id,
+            "decision": decision,
+            "reason": reason,
+        }
+        if depth is not None:
+            entry["delegation_depth"] = depth
+        self._transition_log.append(entry)
 
 # 2019-04-24T14:55:39 update
 
