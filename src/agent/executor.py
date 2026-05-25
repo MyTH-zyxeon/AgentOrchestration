@@ -1,9 +1,14 @@
 """Agent Executor — Handles task execution within agent sandboxes."""
 
 import asyncio
+import json
 import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
+
+
+class ResultSerializationError(ValueError):
+    """Raised when a tool result cannot be persisted as strict JSON."""
 
 
 class AgentExecutor:
@@ -13,7 +18,12 @@ class AgentExecutor:
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
@@ -29,11 +39,17 @@ class AgentExecutor:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
-        return {
+        execution_record = {
             "execution_id": exec_id,
             "agent_id": agent_id,
             "task_id": task.get("id"),
@@ -41,6 +57,16 @@ class AgentExecutor:
             "duration": duration,
             "timestamp": time.time(),
         }
+        self._validate_json_result(execution_record)
+        return execution_record
+
+    def _validate_json_result(self, execution_record: Dict[str, Any]) -> None:
+        try:
+            json.dumps(execution_record, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ResultSerializationError(
+                f"tool result must be JSON-serializable: {exc}"
+            ) from exc
 
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
@@ -56,7 +82,10 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
 
 # 2019-01-31T14:19:34 update
 
