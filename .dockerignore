@@ -1,0 +1,17 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+node_modules
+dist
+build
+htmlcov
+.coverage
+coverage
+.DS_Store
+uv.lock
