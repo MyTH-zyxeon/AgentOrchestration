@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -9,6 +8,47 @@ class TestConfig:
         config = Config(str(config_file))
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
+
+    def test_load_yaml_config(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "app:\n"
+            "  name: yaml-test\n"
+            "  port: 9090\n"
+            "features:\n"
+            "  retries: true\n"
+        )
+
+        config = Config(str(config_file))
+
+        assert config.get("app.name") == "yaml-test"
+        assert config.get("app.port") == 9090
+        assert config.get("features.retries") is True
+
+    def test_rejects_unsupported_config_extension(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("app.name = 'test'")
+
+        try:
+            Config(str(config_file))
+        except ValueError as exc:
+            assert "Unsupported config format '.toml'" in str(exc)
+            assert ".json" in str(exc)
+            assert ".yaml" in str(exc)
+            assert ".yml" in str(exc)
+        else:
+            raise AssertionError("Expected unsupported config format error")
+
+    def test_rejects_non_mapping_yaml_config(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("- app\n- database\n")
+
+        try:
+            Config(str(config_file))
+        except ValueError as exc:
+            assert "top-level mapping" in str(exc)
+        else:
+            raise AssertionError("Expected non-mapping config error")
 
     def test_default_value(self):
         config = Config()
