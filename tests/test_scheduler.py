@@ -36,6 +36,57 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_rate_limit_defers_prefetch_without_claiming_next_task(self):
+        self.scheduler.set_rate_limit(
+            queue="default",
+            max_prefetch=1,
+            window_seconds=60,
+        )
+        first_id = self.scheduler.enqueue({"type": "first"})
+        second_id = self.scheduler.enqueue({"type": "second"})
+
+        import asyncio
+        first_task = asyncio.run(self.scheduler.dequeue())
+        second_task = asyncio.run(self.scheduler.dequeue())
+
+        assert first_task["id"] == first_id
+        assert second_task is None
+        assert second_id not in self.scheduler._in_flight
+        assert self.scheduler._queues["default"].peek()["id"] == second_id
+        assert self.scheduler.audit_log[-1] == {
+            "decision": "deferred",
+            "queue": "default",
+            "reason": "rate_limit_exceeded",
+        }
+
+    def test_prefetch_records_claims_after_rate_limit_allows_them(self):
+        self.scheduler.set_rate_limit(
+            queue="default",
+            max_prefetch=2,
+            window_seconds=60,
+        )
+        self.scheduler.enqueue({"type": "first"})
+        self.scheduler.enqueue({"type": "second"})
+        self.scheduler.enqueue({"type": "third"})
+
+        import asyncio
+        tasks = asyncio.run(self.scheduler.prefetch(limit=3))
+
+        assert [task["type"] for task in tasks] == ["first", "second"]
+        assert self.scheduler._queues["default"].peek()["type"] == "third"
+        assert self.scheduler.audit_log[-1] == {
+            "decision": "deferred",
+            "queue": "default",
+            "reason": "rate_limit_exceeded",
+        }
+
+    def test_rate_limit_validation_rejects_invalid_policy(self):
+        with pytest.raises(ValueError):
+            self.scheduler.set_rate_limit(max_prefetch=0)
+
+        with pytest.raises(ValueError):
+            self.scheduler.set_rate_limit(window_seconds=0)
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update

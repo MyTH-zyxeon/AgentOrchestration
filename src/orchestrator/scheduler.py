@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -35,9 +34,17 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._rate_limits: Dict[str, Dict[str, float]] = {}
+        self._rate_windows: Dict[str, List[float]] = {}
+        self.audit_log: List[Dict[str, str]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,26 +55,110 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def set_rate_limit(
+        self,
+        queue: str = "default",
+        max_prefetch: int = 1,
+        window_seconds: float = 1.0,
+    ) -> None:
+        if max_prefetch < 1:
+            raise ValueError("max_prefetch must be positive")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        self._rate_limits[queue] = {
+            "max_prefetch": float(max_prefetch),
+            "window_seconds": float(window_seconds),
+        }
+        self._rate_windows.setdefault(queue, [])
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        prefetched = await self.prefetch(queue=queue, limit=1, timeout=timeout)
+        return prefetched[0] if prefetched else None
+
+    async def prefetch(
+        self,
+        queue: str = "default",
+        limit: int = 1,
+        timeout: float = 1.0,
+    ) -> List[Dict]:
         now = time.time()
+        self._activate_scheduled(queue, now)
+        prefetched: List[Dict] = []
+        for _ in range(limit):
+            if not self._rate_limit_allows_prefetch(queue, now):
+                self._record_prefetch_decision(
+                    "deferred",
+                    queue,
+                    "rate_limit_exceeded",
+                )
+                break
+            task = self._claim_next(queue)
+            if task is None:
+                break
+            self._rate_windows.setdefault(queue, []).append(now)
+            prefetched.append(task)
+            self._record_prefetch_decision("claimed", queue, "rate_limit_ok")
+        return prefetched
+
+    def _activate_scheduled(self, queue: str, now: float) -> None:
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
             task = self._scheduled.pop(tid)
             if task:
                 self.enqueue(task, queue)
 
+    def _claim_next(self, queue: str) -> Optional[Dict]:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
                 self._in_flight[task["id"]] = task
                 return task
         return None
+
+    def _rate_limit_allows_prefetch(self, queue: str, now: float) -> bool:
+        limit = self._rate_limits.get(queue)
+        if limit is None:
+            return True
+
+        window_seconds = limit["window_seconds"]
+        window_start = now - window_seconds
+        recent = [
+            timestamp
+            for timestamp in self._rate_windows.get(queue, [])
+            if timestamp > window_start
+        ]
+        self._rate_windows[queue] = recent
+        return len(recent) < int(limit["max_prefetch"])
+
+    def _record_prefetch_decision(
+        self,
+        decision: str,
+        queue: str,
+        reason: str,
+    ) -> None:
+        self.audit_log.append(
+            {
+                "decision": decision,
+                "queue": queue,
+                "reason": reason,
+            }
+        )
 
     def complete(self, task_id: str) -> bool:
         return self._in_flight.pop(task_id, None) is not None
