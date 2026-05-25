@@ -7,6 +7,8 @@ import logging
 from enum import Enum
 from typing import Dict, Optional
 
+from .sandbox import ResourceLimits
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,7 +25,13 @@ class AgentRuntime:
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
 
-    def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
+    def start(
+        self,
+        agent_id: str,
+        command: list,
+        env: Optional[Dict] = None,
+        limits: Optional[ResourceLimits] = None,
+    ) -> bool:
         if agent_id in self._processes and self._processes[agent_id].poll() is None:
             logger.warning(f"Agent {agent_id} is already running")
             return False
@@ -33,6 +41,11 @@ class AgentRuntime:
         if env:
             process_env.update(env)
         process_env["AO_AGENT_ID"] = agent_id
+        popen_kwargs = {}
+        if limits:
+            preexec_fn = limits.as_preexec_fn()
+            if preexec_fn:
+                popen_kwargs["preexec_fn"] = preexec_fn
 
         try:
             proc = subprocess.Popen(
@@ -40,6 +53,7 @@ class AgentRuntime:
                 env=process_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                **popen_kwargs,
             )
             self._processes[agent_id] = proc
             self._states[agent_id] = RuntimeState.RUNNING

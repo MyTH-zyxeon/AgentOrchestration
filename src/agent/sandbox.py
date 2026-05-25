@@ -2,9 +2,13 @@
 
 import os
 import tempfile
-import resource
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows fallback
+    resource = None
 
 
 class ResourceLimits:
@@ -13,20 +17,38 @@ class ResourceLimits:
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
 
+    def as_preexec_fn(self) -> Optional[Callable[[], None]]:
+        if resource is None:
+            return None
+
+        def apply_child_limits() -> None:
+            try:
+                resource.setrlimit(resource.RLIMIT_CPU, (self.cpu_time, self.cpu_time))
+                mem_bytes = self.memory_mb * 1024 * 1024
+                resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+            except (ValueError, resource.error):
+                pass
+
+        return apply_child_limits
+
 
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
         self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
         self._sandboxes: Dict[str, Path] = {}
+        self._limits: Dict[str, ResourceLimits] = {}
 
     def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
         sandbox_path = self.base_path / agent_id
         sandbox_path.mkdir(parents=True, exist_ok=True)
         self._sandboxes[agent_id] = sandbox_path
+        if limits:
+            self._limits[agent_id] = limits
         return sandbox_path
 
     def destroy(self, agent_id: str) -> bool:
         sandbox = self._sandboxes.pop(agent_id, None)
+        self._limits.pop(agent_id, None)
         if sandbox and sandbox.exists():
             import shutil
             shutil.rmtree(sandbox, ignore_errors=True)
@@ -37,12 +59,10 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
-        try:
-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
-            mem_bytes = limits.memory_mb * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
-            pass
+        self._limits[agent_id] = limits
+
+    def get_limits(self, agent_id: str) -> Optional[ResourceLimits]:
+        return self._limits.get(agent_id)
 
     def cleanup_all(self) -> None:
         for agent_id in list(self._sandboxes.keys()):
