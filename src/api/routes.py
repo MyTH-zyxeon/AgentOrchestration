@@ -1,22 +1,43 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from typing import Dict, Optional
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.import_validation import (
+    UNSUPPORTED_WORKFLOW_IMPORT_FILE_ERROR,
+    WORKFLOW_IMPORT_FILE_TYPES,
+    WorkflowImportValidationError,
+    validate_workflow_import_file,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
 
 
+class WorkflowImportValidationRequest(BaseModel):
+    filename: str = Field(..., min_length=1)
+    content_type: Optional[str] = None
+    content: str = Field(..., min_length=1)
+
+
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +74,27 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.get("/workflows/import/accepted-types")
+async def workflow_import_accepted_types():
+    return WORKFLOW_IMPORT_FILE_TYPES.as_dict()
+
+
+@router.post("/workflows/import/validate")
+async def validate_workflow_import(request: WorkflowImportValidationRequest):
+    try:
+        detected_format = validate_workflow_import_file(
+            request.filename,
+            request.content_type,
+            request.content,
+        )
+    except WorkflowImportValidationError:
+        raise HTTPException(
+            status_code=400,
+            detail=UNSUPPORTED_WORKFLOW_IMPORT_FILE_ERROR,
+        )
+    return {"status": "valid", "format": detected_format}
 
 # 2019-03-18T11:10:18 update
 
