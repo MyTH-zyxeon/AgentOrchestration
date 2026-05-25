@@ -16,7 +16,7 @@ class ResourceLimits:
 
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
-        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
+        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_")).resolve()
         self._sandboxes: Dict[str, Path] = {}
 
     def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
@@ -27,11 +27,30 @@ class AgentSandbox:
 
     def destroy(self, agent_id: str) -> bool:
         sandbox = self._sandboxes.pop(agent_id, None)
-        if sandbox and sandbox.exists():
+        if not sandbox:
+            return False
+
+        owned_sandbox = self._resolve_owned_sandbox(sandbox)
+        if not owned_sandbox or not owned_sandbox.exists():
+            return False
+
+        if owned_sandbox.is_dir():
             import shutil
-            shutil.rmtree(sandbox, ignore_errors=True)
-            return True
-        return False
+            shutil.rmtree(owned_sandbox, ignore_errors=True)
+        else:
+            owned_sandbox.unlink(missing_ok=True)
+        return True
+
+    def _resolve_owned_sandbox(self, sandbox: Path) -> Optional[Path]:
+        try:
+            base_path = self.base_path.resolve()
+            sandbox_path = sandbox.resolve()
+            sandbox_path.relative_to(base_path)
+        except (OSError, ValueError):
+            return None
+        if sandbox_path == base_path:
+            return None
+        return sandbox_path
 
     def get_path(self, agent_id: str) -> Optional[Path]:
         return self._sandboxes.get(agent_id)
