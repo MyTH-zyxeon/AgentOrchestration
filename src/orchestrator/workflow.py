@@ -1,7 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 from uuid import uuid4
 
 
@@ -13,8 +13,32 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowParameterError(ValueError):
+    """Raised when workflow parameter binding violates the schema."""
+
+
+class WorkflowParameter:
+    def __init__(
+        self,
+        name: str,
+        aliases: Optional[Iterable[str]] = None,
+        default: Any = None,
+        required: bool = False,
+    ):
+        self.name = name
+        self.aliases = list(aliases or [])
+        self.default = default
+        self.required = required
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -32,7 +56,45 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self.parameters: Dict[str, WorkflowParameter] = {}
+        self._parameter_aliases: Dict[str, str] = {}
+        self.parameter_audit_log: List[Dict[str, str]] = []
         self.status = StepStatus.PENDING
+
+    def add_parameter(
+        self,
+        name: str,
+        aliases: Optional[Iterable[str]] = None,
+        default: Any = None,
+        required: bool = False,
+    ) -> "Workflow":
+        parameter = WorkflowParameter(name, aliases, default, required)
+        pending_aliases = self._collect_parameter_aliases(parameter)
+
+        for alias_key, display_name in pending_aliases.items():
+            owner = self._parameter_aliases.get(alias_key)
+            if owner is not None:
+                self._record_parameter_decision(
+                    "rejected",
+                    "duplicate_parameter_alias",
+                    parameter.name,
+                    display_name,
+                )
+                raise WorkflowParameterError(
+                    f"parameter alias '{display_name}' already maps to "
+                    f"'{owner}'"
+                )
+
+        self.parameters[parameter.name] = parameter
+        for alias_key in pending_aliases:
+            self._parameter_aliases[alias_key] = parameter.name
+        self._record_parameter_decision(
+            "registered",
+            "unique_parameter_aliases",
+            parameter.name,
+            str(len(pending_aliases) - 1),
+        )
+        return self
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -42,13 +104,129 @@ class Workflow:
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
 
+    def resolve_parameters(self, inputs: Mapping[str, Any]) -> Dict[str, Any]:
+        if not self.parameters:
+            return dict(inputs)
+
+        resolved: Dict[str, Any] = {}
+        input_sources: Dict[str, str] = {}
+        for raw_name, value in inputs.items():
+            alias_key = self._normalize_parameter_key(raw_name)
+            parameter_name = self._parameter_aliases.get(alias_key)
+            if parameter_name is None:
+                self._record_parameter_decision(
+                    "rejected",
+                    "unknown_parameter",
+                    str(raw_name),
+                    str(raw_name),
+                )
+                raise WorkflowParameterError(
+                    f"unknown workflow parameter '{raw_name}'"
+                )
+            if parameter_name in resolved:
+                self._record_parameter_decision(
+                    "rejected",
+                    "duplicate_parameter_input",
+                    parameter_name,
+                    str(raw_name),
+                )
+                previous = input_sources[parameter_name]
+                raise WorkflowParameterError(
+                    f"parameter '{parameter_name}' was provided by both "
+                    f"'{previous}' and '{raw_name}'"
+                )
+            resolved[parameter_name] = value
+            input_sources[parameter_name] = str(raw_name)
+
+        for name, parameter in self.parameters.items():
+            if name in resolved:
+                continue
+            if parameter.required:
+                self._record_parameter_decision(
+                    "rejected",
+                    "missing_required_parameter",
+                    name,
+                    name,
+                )
+                raise WorkflowParameterError(
+                    f"missing required workflow parameter '{name}'"
+                )
+            if parameter.default is not None:
+                resolved[name] = parameter.default
+
+        self._record_parameter_decision(
+            "resolved",
+            "workflow_parameters_bound",
+            str(len(resolved)),
+            "",
+        )
+        return resolved
+
+    def _collect_parameter_aliases(
+        self,
+        parameter: WorkflowParameter,
+    ) -> Dict[str, str]:
+        aliases: Dict[str, str] = {}
+        for display_name in [parameter.name] + parameter.aliases:
+            alias_key = self._normalize_parameter_key(display_name)
+            if alias_key in aliases:
+                self._record_parameter_decision(
+                    "rejected",
+                    "duplicate_parameter_alias",
+                    parameter.name,
+                    display_name,
+                )
+                raise WorkflowParameterError(
+                    f"parameter alias '{display_name}' duplicates another "
+                    "alias"
+                )
+            aliases[alias_key] = display_name
+        return aliases
+
+    def _record_parameter_decision(
+        self,
+        decision: str,
+        reason: str,
+        parameter: str,
+        alias: str,
+    ) -> None:
+        self.parameter_audit_log.append(
+            {
+                "decision": decision,
+                "reason": reason,
+                "parameter": parameter,
+                "alias": alias,
+            }
+        )
+
+    @staticmethod
+    def _normalize_parameter_key(value: str) -> str:
+        normalized = str(value).strip().lower()
+        if not normalized:
+            raise WorkflowParameterError(
+                "workflow parameter names cannot be empty"
+            )
+        return normalized
+
 
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
 
-    def create_workflow(self, name: str, description: str = "") -> Workflow:
+    def create_workflow(
+        self,
+        name: str,
+        description: str = "",
+        parameters: Optional[Iterable[WorkflowParameter]] = None,
+    ) -> Workflow:
         workflow = Workflow(name, description)
+        for parameter in parameters or []:
+            workflow.add_parameter(
+                parameter.name,
+                aliases=parameter.aliases,
+                default=parameter.default,
+                required=parameter.required,
+            )
         self._workflows[workflow.id] = workflow
         return workflow
 
