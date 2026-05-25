@@ -1,14 +1,18 @@
 """Agent Sandbox — Isolated execution environment for agents."""
 
-import os
-import tempfile
 import resource
-from typing import Dict, Optional
+import tempfile
 from pathlib import Path
+from typing import Dict, Optional
 
 
 class ResourceLimits:
-    def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
+    def __init__(
+        self,
+        cpu_time: int = 60,
+        memory_mb: int = 512,
+        disk_mb: int = 100,
+    ):
         self.cpu_time = cpu_time
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
@@ -16,10 +20,16 @@ class ResourceLimits:
 
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
-        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
+        if base_path is None:
+            base_path = tempfile.mkdtemp(prefix="ao_sandbox_")
+        self.base_path = Path(base_path)
         self._sandboxes: Dict[str, Path] = {}
 
-    def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
+    def create(
+        self,
+        agent_id: str,
+        limits: Optional[ResourceLimits] = None,
+    ) -> Path:
         sandbox_path = self.base_path / agent_id
         sandbox_path.mkdir(parents=True, exist_ok=True)
         self._sandboxes[agent_id] = sandbox_path
@@ -34,19 +44,39 @@ class AgentSandbox:
         return False
 
     def get_path(self, agent_id: str) -> Optional[Path]:
-        return self._sandboxes.get(agent_id)
+        sandbox = self._sandboxes.get(agent_id)
+        if sandbox is None:
+            return None
+        if self._is_tracked_path_valid(sandbox):
+            return sandbox
+        self._sandboxes.pop(agent_id, None)
+        return None
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (limits.cpu_time, limits.cpu_time),
+            )
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, resource.error):
             pass
 
     def cleanup_all(self) -> None:
         for agent_id in list(self._sandboxes.keys()):
             self.destroy(agent_id)
+
+    def _is_tracked_path_valid(self, sandbox: Path) -> bool:
+        try:
+            if not sandbox.exists() or not sandbox.is_dir():
+                return False
+            base_resolved = self.base_path.resolve()
+            sandbox_resolved = sandbox.resolve()
+            sandbox_resolved.relative_to(base_resolved)
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
 
 # 2019-01-10T19:56:24 update
 
