@@ -1,16 +1,29 @@
 """Orchestrator API client SDK."""
 
 import json
+import math
 import os
-from typing import Any, Dict, List, Optional
-from urllib.request import Request, urlopen
+from typing import Dict, Optional
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+
+DEFAULT_REQUEST_TIMEOUT = 30.0
 
 
 class OrchestratorClient:
-    def __init__(self, base_url: str = None, api_key: str = None):
-        self.base_url = base_url or os.getenv("AO_API_URL", "https://api.agent-orchestrator.io")
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ):
+        self.base_url = base_url or os.getenv(
+            "AO_API_URL",
+            "https://api.agent-orchestrator.io",
+        )
         self.api_key = api_key or os.getenv("AO_API_KEY", "")
+        self.timeout = self._resolve_timeout(timeout)
         self._session = None
 
     def _request(self, method: str, path: str, data: Dict = None) -> Dict:
@@ -23,12 +36,25 @@ class OrchestratorClient:
         req = Request(url, data=body, headers=headers, method=method)
 
         try:
-            with urlopen(req) as resp:
+            with urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode())
         except HTTPError as e:
             return {"error": e.code, "message": e.reason}
 
-    def register_agent(self, name: str, agent_type: str, config: Dict = None) -> Dict:
+    def _resolve_timeout(self, timeout: Optional[float]) -> float:
+        if timeout is None:
+            timeout = os.getenv("AO_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)
+        value = float(timeout)
+        if value <= 0 or not math.isfinite(value):
+            raise ValueError("request timeout must be a positive finite value")
+        return value
+
+    def register_agent(
+        self,
+        name: str,
+        agent_type: str,
+        config: Dict = None,
+    ) -> Dict:
         return self._request("POST", "/agents", {
             "name": name,
             "agent_type": agent_type,
