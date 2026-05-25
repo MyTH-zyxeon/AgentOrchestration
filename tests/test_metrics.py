@@ -1,4 +1,3 @@
-import pytest
 from src.common.metrics import MetricsCollector
 
 
@@ -30,6 +29,36 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_same_metric_name_is_isolated_by_namespace(self):
+        self.metrics.increment("tasks.completed", namespace="agent-a")
+        self.metrics.increment("tasks.completed", value=3, namespace="agent-b")
+
+        snapshot = self.metrics.snapshot()
+
+        assert "tasks.completed" not in snapshot["counters"]
+        assert (
+            snapshot["namespaces"]["agent-a"]["counters"]["tasks.completed"]
+            == 1
+        )
+        assert (
+            snapshot["namespaces"]["agent-b"]["counters"]["tasks.completed"]
+            == 3
+        )
+
+    def test_collector_default_namespace_keeps_legacy_snapshot_shape(self):
+        metrics = MetricsCollector(namespace="agent-a")
+
+        metrics.gauge("memory.usage", 42.0)
+        metrics.observe("latency", 0.2)
+
+        snapshot = metrics.snapshot()
+
+        assert snapshot["gauges"]["memory.usage"] == 42.0
+        assert snapshot["histograms"]["latency"]["avg"] == 0.2
+        assert snapshot["namespaces"]["agent-a"]["gauges"] == {
+            "memory.usage": 42.0
+        }
 
 # 2019-07-16T09:29:21 update
 

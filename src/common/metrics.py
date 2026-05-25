@@ -3,49 +3,107 @@
 import time
 from collections import defaultdict
 from typing import Dict, List
-from threading import Lock
+from threading import RLock
+
+DEFAULT_NAMESPACE = "global"
 
 
 class MetricsCollector:
-    def __init__(self):
-        self._lock = Lock()
-        self._counters: Dict[str, int] = defaultdict(int)
-        self._gauges: Dict[str, float] = {}
-        self._histograms: Dict[str, List[float]] = defaultdict(list)
-        self._timers: Dict[str, float] = {}
+    def __init__(self, namespace: str = DEFAULT_NAMESPACE):
+        self.default_namespace = self._normalize_namespace(namespace)
+        self._lock = RLock()
+        self._counters: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+        self._gauges: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self._histograms: Dict[str, Dict[str, List[float]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        self._timers: Dict[str, Dict[str, float]] = defaultdict(dict)
 
-    def increment(self, metric: str, value: int = 1) -> None:
+    def increment(
+        self,
+        metric: str,
+        value: int = 1,
+        namespace: str = None,
+    ) -> None:
         with self._lock:
-            self._counters[metric] += value
+            ns = self._namespace(namespace)
+            self._counters[ns][metric] += value
 
-    def gauge(self, metric: str, value: float) -> None:
+    def gauge(
+        self,
+        metric: str,
+        value: float,
+        namespace: str = None,
+    ) -> None:
         with self._lock:
-            self._gauges[metric] = value
+            ns = self._namespace(namespace)
+            self._gauges[ns][metric] = value
 
-    def observe(self, metric: str, value: float) -> None:
+    def observe(
+        self,
+        metric: str,
+        value: float,
+        namespace: str = None,
+    ) -> None:
         with self._lock:
-            self._histograms[metric].append(value)
+            ns = self._namespace(namespace)
+            self._histograms[ns][metric].append(value)
 
-    def start_timer(self, metric: str) -> None:
+    def start_timer(self, metric: str, namespace: str = None) -> None:
         with self._lock:
-            self._timers[metric] = time.time()
+            ns = self._namespace(namespace)
+            self._timers[ns][metric] = time.time()
 
-    def stop_timer(self, metric: str) -> float:
+    def stop_timer(self, metric: str, namespace: str = None) -> float:
         with self._lock:
-            if metric in self._timers:
-                duration = time.time() - self._timers.pop(metric)
-                self.observe(metric, duration)
+            ns = self._namespace(namespace)
+            if metric in self._timers[ns]:
+                duration = time.time() - self._timers[ns].pop(metric)
+                self.observe(metric, duration, namespace=ns)
                 return duration
         return 0.0
 
     def snapshot(self) -> Dict:
         with self._lock:
+            default = self._namespace(None)
             return {
-                "counters": dict(self._counters),
-                "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "counters": dict(self._counters.get(default, {})),
+                "gauges": dict(self._gauges.get(default, {})),
+                "histograms": self._snapshot_histograms(default),
+                "namespaces": {
+                    namespace: {
+                        "counters": dict(
+                            self._counters.get(namespace, {})
+                        ),
+                        "gauges": dict(self._gauges.get(namespace, {})),
+                        "histograms": self._snapshot_histograms(namespace),
+                    }
+                    for namespace in self._namespace_names()
+                },
             }
+
+    def _namespace(self, namespace: str = None) -> str:
+        return self._normalize_namespace(namespace or self.default_namespace)
+
+    def _normalize_namespace(self, namespace: str) -> str:
+        namespace = str(namespace).strip()
+        return namespace or DEFAULT_NAMESPACE
+
+    def _namespace_names(self) -> List[str]:
+        names = set(self._counters) | set(self._gauges) | set(self._histograms)
+        return sorted(names)
+
+    def _snapshot_histograms(self, namespace: str) -> Dict:
+        return {
+            metric: {
+                "count": len(values),
+                "sum": sum(values),
+                "avg": sum(values) / len(values) if values else 0,
+            }
+            for metric, values in self._histograms.get(namespace, {}).items()
+        }
 
 
 metrics = MetricsCollector()
