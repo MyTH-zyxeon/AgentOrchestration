@@ -1,8 +1,11 @@
 """API middleware components."""
 
-import time
+import base64
+import json
 import logging
-from typing import Callable
+import os
+import time
+from typing import Any, Callable, Dict, Iterable, Set
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,11 +13,92 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+def decode_token_claims(token: str) -> Dict[str, Any]:
+    parts = token.split(".")
+    if len(parts) < 2:
+        raise ValueError("malformed token")
+
+    payload = parts[1]
+    padded = payload + "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        claims = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("malformed token claims") from exc
+
+    if not isinstance(claims, dict):
+        raise ValueError("token claims must be an object")
+    return claims
+
+
+def _claim_values(claims: Dict[str, Any], key: str) -> Set[str]:
+    value = claims.get(key)
+    if isinstance(value, str):
+        return {part for part in value.split() if part}
+    if isinstance(value, Iterable):
+        return {str(part) for part in value if str(part)}
+    return set()
+
+
+def validate_worker_claims(
+    claims: Dict[str, Any],
+    now: float,
+    revoked_token_ids: Set[str],
+) -> None:
+    subject = claims.get("sub")
+    workspace_id = claims.get("workspace_id")
+    role = claims.get("role")
+    if not subject or not workspace_id or not role:
+        raise ValueError("anonymous or incomplete principal")
+
+    if str(claims.get("jti", "")) in revoked_token_ids:
+        raise ValueError("revoked token")
+
+    not_before = claims.get("nbf")
+    if not_before is not None and float(not_before) > now:
+        raise ValueError("token not active yet")
+
+    expires_at = claims.get("exp")
+    if expires_at is not None and float(expires_at) <= now:
+        raise ValueError("expired token")
+
+    scopes = _claim_values(claims, "scope") | _claim_values(claims, "scopes")
+    roles = {str(role), *(_claim_values(claims, "roles"))}
+    if "worker" not in scopes and "worker" not in roles:
+        raise ValueError("insufficient worker scope")
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    def __init__(self, app, revoked_token_ids: Iterable[str] = ()):
+        super().__init__(app)
+        env_revoked = os.getenv("AO_REVOKED_TOKEN_IDS", "")
+        self.revoked_token_ids = {
+            token_id
+            for token_id in [*revoked_token_ids, *env_revoked.split(",")]
+            if token_id
+        }
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
+                return Response(status_code=401, content="Unauthorized")
+            try:
+                raw_token = token.removeprefix("Bearer ").strip()
+                claims = decode_token_claims(raw_token)
+                validate_worker_claims(
+                    claims,
+                    now=time.time(),
+                    revoked_token_ids=self.revoked_token_ids,
+                )
+            except (TypeError, ValueError, OverflowError):
                 return Response(status_code=401, content="Unauthorized")
         return await call_next(request)
 
@@ -26,14 +110,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +133,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
