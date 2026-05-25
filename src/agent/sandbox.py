@@ -8,20 +8,41 @@ from pathlib import Path
 
 
 class ResourceLimits:
-    def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
+    def __init__(
+        self,
+        cpu_time: int = 60,
+        memory_mb: int = 512,
+        disk_mb: int = 100,
+    ):
         self.cpu_time = cpu_time
         self.memory_mb = memory_mb
         self.disk_mb = disk_mb
 
 
+SANDBOX_DIR_MODE = 0o700
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(mode=SANDBOX_DIR_MODE, parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(path, SANDBOX_DIR_MODE)
+
+
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
-        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
+        self.base_path = Path(
+            base_path or tempfile.mkdtemp(prefix="ao_sandbox_")
+        )
+        _ensure_private_dir(self.base_path)
         self._sandboxes: Dict[str, Path] = {}
 
-    def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
+    def create(
+        self,
+        agent_id: str,
+        limits: Optional[ResourceLimits] = None,
+    ) -> Path:
         sandbox_path = self.base_path / agent_id
-        sandbox_path.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(sandbox_path)
         self._sandboxes[agent_id] = sandbox_path
         return sandbox_path
 
@@ -38,10 +59,13 @@ class AgentSandbox:
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (limits.cpu_time, limits.cpu_time),
+            )
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, resource.error):
             pass
 
     def cleanup_all(self) -> None:
