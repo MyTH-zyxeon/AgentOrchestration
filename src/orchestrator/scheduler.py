@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import inspect
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -30,14 +30,35 @@ class PriorityQueue:
         return len(self._queue)
 
 
+class QueuePausedError(RuntimeError):
+    """Raised when queue intake is paused for maintenance."""
+
+
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._in_flight_queues: Dict[str, str] = {}
+        self._paused_queues: Dict[str, Dict[str, Any]] = {}
+        self.audit_log: List[Dict[str, Any]] = []
+        self.operator_alerts: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        if queue in self._paused_queues:
+            self._record_queue_decision(
+                "rejected",
+                queue,
+                "intake_paused",
+            )
+            raise QueuePausedError(f"queue intake is paused: {queue}")
+
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +69,31 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        if queue in self._paused_queues:
+            self._record_queue_decision(
+                "deferred",
+                queue,
+                "intake_paused",
+            )
+            return None
+
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -66,20 +105,139 @@ class TaskScheduler:
             task = self._queues[queue].pop()
             if task:
                 self._in_flight[task["id"]] = task
+                self._in_flight_queues[task["id"]] = queue
                 return task
         return None
 
+    def pause_intake(
+        self,
+        queue: str = "default",
+        reason: str = "maintenance",
+    ) -> Dict[str, Any]:
+        status = {
+            "queue": queue,
+            "state": "paused",
+            "reason": reason,
+            "paused_at": time.time(),
+        }
+        self._paused_queues[queue] = status
+        self._record_queue_decision("paused", queue, reason)
+        return dict(status)
+
+    def resume_intake(self, queue: str = "default") -> bool:
+        paused = self._paused_queues.pop(queue, None)
+        if paused is None:
+            return False
+        self._record_queue_decision("resumed", queue, paused["reason"])
+        return True
+
+    def queue_status(self, queue: str = "default") -> Dict[str, Any]:
+        paused = self._paused_queues.get(queue)
+        state = "paused" if paused else "active"
+        return {
+            "queue": queue,
+            "state": state,
+            "reason": paused["reason"] if paused else None,
+            "queued": len(self._queues.get(queue, [])),
+            "in_flight": self._count_in_flight(queue),
+        }
+
+    async def drain(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+        poll_interval: float = 0.01,
+    ) -> bool:
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+
+        deadline = time.time() + timeout
+        while self._count_in_flight(queue) > 0:
+            if time.time() >= deadline:
+                self._record_queue_decision(
+                    "drain_timeout",
+                    queue,
+                    "leased_tasks",
+                )
+                return False
+            await self._sleep(poll_interval)
+        self._record_queue_decision("drained", queue, "leased_tasks")
+        return True
+
+    async def run_maintenance(
+        self,
+        migration: Callable[[], Any],
+        queue: str = "default",
+        drain_timeout: float = 1.0,
+    ) -> Any:
+        self.pause_intake(queue=queue, reason="maintenance")
+        drained = await self.drain(queue=queue, timeout=drain_timeout)
+        if not drained:
+            self._operator_alert(queue, "drain_timeout")
+            raise TimeoutError(f"queue did not drain before timeout: {queue}")
+
+        try:
+            result = migration()
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            self._operator_alert(queue, "migration_failed")
+            raise exc
+
+        self.resume_intake(queue)
+        return result
+
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        completed = self._in_flight.pop(task_id, None) is not None
+        if completed:
+            self._in_flight_queues.pop(task_id, None)
+        return completed
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
+        self._in_flight_queues.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    async def _sleep(self, delay: float) -> None:
+        import asyncio
+        await asyncio.sleep(delay)
+
+    def _count_in_flight(self, queue: str) -> int:
+        return sum(
+            1
+            for task_queue in self._in_flight_queues.values()
+            if task_queue == queue
+        )
+
+    def _record_queue_decision(
+        self,
+        decision: str,
+        queue: str,
+        reason: str,
+    ) -> None:
+        self.audit_log.append(
+            {
+                "decision": decision,
+                "queue": queue,
+                "reason": reason,
+            }
+        )
+
+    def _operator_alert(self, queue: str, reason: str) -> None:
+        self.operator_alerts.append(
+            {
+                "queue": queue,
+                "reason": reason,
+                "state": "paused",
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 

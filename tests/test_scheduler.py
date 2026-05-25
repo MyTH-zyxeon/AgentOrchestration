@@ -1,5 +1,5 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import QueuePausedError, TaskScheduler
 
 
 class TestTaskScheduler:
@@ -35,6 +35,96 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_pause_intake_rejects_new_tasks_and_reports_health(self):
+        status = self.scheduler.pause_intake(reason="schema_migration")
+
+        with pytest.raises(QueuePausedError):
+            self.scheduler.enqueue({"type": "test"})
+
+        assert status["state"] == "paused"
+        assert self.scheduler.queue_status() == {
+            "queue": "default",
+            "state": "paused",
+            "reason": "schema_migration",
+            "queued": 0,
+            "in_flight": 0,
+        }
+        assert self.scheduler.audit_log[-1] == {
+            "decision": "rejected",
+            "queue": "default",
+            "reason": "intake_paused",
+        }
+
+    def test_pause_intake_defers_dequeue_without_claiming_queued_task(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        self.scheduler.pause_intake()
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task is None
+        assert task_id not in self.scheduler._in_flight
+        assert self.scheduler._queues["default"].peek()["id"] == task_id
+        assert self.scheduler.audit_log[-1] == {
+            "decision": "deferred",
+            "queue": "default",
+            "reason": "intake_paused",
+        }
+
+    def test_drain_reports_timeout_until_leased_tasks_complete(self):
+        self.scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        self.scheduler.pause_intake()
+
+        assert not asyncio.run(self.scheduler.drain(timeout=0))
+        assert self.scheduler.audit_log[-1] == {
+            "decision": "drain_timeout",
+            "queue": "default",
+            "reason": "leased_tasks",
+        }
+
+        self.scheduler.complete(task["id"])
+        assert asyncio.run(self.scheduler.drain(timeout=0))
+        assert self.scheduler.audit_log[-1] == {
+            "decision": "drained",
+            "queue": "default",
+            "reason": "leased_tasks",
+        }
+
+    def test_run_maintenance_resumes_after_successful_migration(self):
+        events = []
+
+        def migration():
+            events.append(self.scheduler.queue_status()["state"])
+            return "migrated"
+
+        import asyncio
+        result = asyncio.run(self.scheduler.run_maintenance(migration))
+
+        assert result == "migrated"
+        assert events == ["paused"]
+        assert self.scheduler.queue_status()["state"] == "active"
+        assert self.scheduler.operator_alerts == []
+
+    def test_failed_maintenance_keeps_intake_paused_and_alerts_operator(self):
+        def migration():
+            raise RuntimeError("migration failed")
+
+        import asyncio
+        with pytest.raises(RuntimeError):
+            asyncio.run(self.scheduler.run_maintenance(migration))
+
+        assert self.scheduler.queue_status()["state"] == "paused"
+        assert self.scheduler.operator_alerts == [
+            {
+                "queue": "default",
+                "reason": "migration_failed",
+                "state": "paused",
+            }
+        ]
 
 # 2019-01-09T19:07:03 update
 
