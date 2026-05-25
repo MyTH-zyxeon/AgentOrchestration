@@ -31,6 +31,40 @@ class TestMetricsCollector:
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
 
+    def test_increment_allows_large_counter_without_exporter_limit(self):
+        large_value = 2**63
+        self.metrics.increment("requests.total", large_value)
+
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["counters"]["requests.total"] == large_value
+
+    def test_increment_raises_when_exporter_limit_would_be_exceeded(self):
+        metrics = MetricsCollector(max_counter=2**63 - 1)
+        metrics.increment("requests.total", 2**63 - 2)
+
+        with pytest.raises(ValueError, match="would exceed max_counter"):
+            metrics.increment("requests.total", 2)
+
+        snapshot = metrics.snapshot()
+        assert snapshot["counters"]["requests.total"] == 2**63 - 2
+
+    def test_increment_can_clamp_at_exporter_limit(self):
+        metrics = MetricsCollector(
+            max_counter=10,
+            counter_overflow_policy="clamp",
+        )
+
+        metrics.increment("requests.total", 8)
+        metrics.increment("requests.total", 5)
+
+        snapshot = metrics.snapshot()
+        assert snapshot["counters"]["requests.total"] == 10
+
+    def test_increment_rejects_invalid_exporter_limit(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            MetricsCollector(max_counter=-1)
+
 # 2019-07-16T09:29:21 update
 
 # 2019-09-09T13:35:42 update

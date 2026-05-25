@@ -2,13 +2,29 @@
 
 import time
 from collections import defaultdict
-from typing import Dict, List
-from threading import Lock
+from threading import RLock
+from typing import Dict, List, Literal, Optional
+
+
+CounterOverflowPolicy = Literal["raise", "clamp"]
 
 
 class MetricsCollector:
-    def __init__(self):
-        self._lock = Lock()
+    def __init__(
+        self,
+        max_counter: Optional[int] = None,
+        counter_overflow_policy: CounterOverflowPolicy = "raise",
+    ):
+        if max_counter is not None and max_counter < 0:
+            raise ValueError("max_counter must be non-negative")
+        if counter_overflow_policy not in ("raise", "clamp"):
+            raise ValueError(
+                "counter_overflow_policy must be 'raise' or 'clamp'"
+            )
+
+        self._lock = RLock()
+        self._max_counter = max_counter
+        self._counter_overflow_policy = counter_overflow_policy
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
         self._histograms: Dict[str, List[float]] = defaultdict(list)
@@ -16,7 +32,19 @@ class MetricsCollector:
 
     def increment(self, metric: str, value: int = 1) -> None:
         with self._lock:
-            self._counters[metric] += value
+            next_value = self._counters[metric] + value
+            if (
+                self._max_counter is not None
+                and next_value > self._max_counter
+            ):
+                if self._counter_overflow_policy == "clamp":
+                    next_value = self._max_counter
+                else:
+                    raise ValueError(
+                        f"counter {metric!r} would exceed max_counter "
+                        f"{self._max_counter}"
+                    )
+            self._counters[metric] = next_value
 
     def gauge(self, metric: str, value: float) -> None:
         with self._lock:
@@ -43,8 +71,14 @@ class MetricsCollector:
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    k: {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
             }
 
 
