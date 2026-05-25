@@ -14,15 +14,31 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        retry_artifacts: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.attempts = 0
+        self.retry_artifacts = set(retry_artifacts or [])
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+
+    def blocks_artifact_cleanup(self, artifact_id: str) -> bool:
+        if artifact_id not in self.retry_artifacts:
+            return False
+        if self.status in (StepStatus.COMPLETED, StepStatus.SKIPPED):
+            return False
+        return self.attempts <= self.retries
 
 
 class Workflow:
@@ -46,6 +62,7 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._cleanup_audit: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -61,6 +78,68 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def plan_artifact_cleanup(
+        self,
+        workflow_id: str,
+        artifact_id: str,
+    ) -> Dict[str, Any]:
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            decision = {
+                "allowed": False,
+                "reason": "workflow_not_found",
+                "artifact_id": artifact_id,
+                "blocked_steps": [],
+            }
+            self._record_cleanup_decision(workflow_id, decision)
+            return decision
+
+        blocked_steps = [
+            step
+            for step in workflow.steps
+            if step.blocks_artifact_cleanup(artifact_id)
+        ]
+        decision = {
+            "allowed": not blocked_steps,
+            "reason": (
+                "safe_to_cleanup"
+                if not blocked_steps
+                else "retry_dependency_pending"
+            ),
+            "artifact_id": artifact_id,
+            "blocked_steps": [
+                {
+                    "step_id": step.id,
+                    "step_name": step.name,
+                    "status": step.status.value,
+                    "attempts": step.attempts,
+                    "retries": step.retries,
+                }
+                for step in blocked_steps
+            ],
+        }
+        self._record_cleanup_decision(workflow_id, decision)
+        return decision
+
+    def cleanup_audit(self) -> List[Dict[str, Any]]:
+        return list(self._cleanup_audit)
+
+    def _record_cleanup_decision(
+        self,
+        workflow_id: str,
+        decision: Dict[str, Any],
+    ) -> None:
+        self._cleanup_audit.append({
+            "workflow_id": workflow_id,
+            "artifact_id": decision["artifact_id"],
+            "allowed": decision["allowed"],
+            "reason": decision["reason"],
+            "blocked_step_ids": [
+                step["step_id"]
+                for step in decision["blocked_steps"]
+            ],
+        })
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
@@ -69,6 +148,7 @@ class WorkflowManager:
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
+            step.attempts += 1
             try:
                 result = step.handler()
                 step.result = result
