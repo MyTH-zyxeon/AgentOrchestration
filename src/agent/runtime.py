@@ -5,7 +5,7 @@ import signal
 import subprocess
 import logging
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,19 +22,22 @@ class AgentRuntime:
     def __init__(self):
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
+        self._environments: Dict[str, Dict[str, str]] = {}
 
-    def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
-        if agent_id in self._processes and self._processes[agent_id].poll() is None:
+    def start(
+        self,
+        agent_id: str,
+        command: list,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> bool:
+        existing = self._processes.get(agent_id)
+        if existing and existing.poll() is None:
             logger.warning(f"Agent {agent_id} is already running")
             return False
 
-        self._states[agent_id] = RuntimeState.STARTING
-        process_env = os.environ.copy()
-        if env:
-            process_env.update(env)
-        process_env["AO_AGENT_ID"] = agent_id
-
         try:
+            process_env = self._build_process_env(agent_id, env)
+            self._states[agent_id] = RuntimeState.STARTING
             proc = subprocess.Popen(
                 command,
                 env=process_env,
@@ -42,6 +45,7 @@ class AgentRuntime:
                 stderr=subprocess.PIPE,
             )
             self._processes[agent_id] = proc
+            self._environments[agent_id] = dict(process_env)
             self._states[agent_id] = RuntimeState.RUNNING
             logger.info(f"Agent {agent_id} started (PID: {proc.pid})")
             return True
@@ -49,6 +53,26 @@ class AgentRuntime:
             self._states[agent_id] = RuntimeState.CRASHED
             logger.error(f"Failed to start agent {agent_id}: {e}")
             return False
+
+    def _build_process_env(
+        self,
+        agent_id: str,
+        env: Optional[Mapping[str, str]],
+    ) -> Dict[str, str]:
+        process_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("AO_AGENT_")
+        }
+        if env:
+            for key, value in env.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    raise TypeError(
+                        "agent environment keys and values must be strings"
+                    )
+                process_env[key] = value
+        process_env["AO_AGENT_ID"] = agent_id
+        return process_env
 
     def stop(self, agent_id: str, timeout: int = 10) -> bool:
         proc = self._processes.get(agent_id)
@@ -64,6 +88,7 @@ class AgentRuntime:
             proc.wait()
 
         self._states[agent_id] = RuntimeState.STOPPED
+        self._environments.pop(agent_id, None)
         logger.info(f"Agent {agent_id} stopped")
         return True
 
@@ -76,6 +101,10 @@ class AgentRuntime:
     def is_running(self, agent_id: str) -> bool:
         proc = self._processes.get(agent_id)
         return proc is not None and proc.poll() is None
+
+    def get_environment(self, agent_id: str) -> Optional[Dict[str, str]]:
+        env = self._environments.get(agent_id)
+        return dict(env) if env is not None else None
 
 # 2019-01-11T10:56:26 update
 
