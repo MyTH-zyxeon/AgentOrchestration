@@ -1,7 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from uuid import uuid4
 
 
@@ -13,13 +13,25 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowValidationError(ValueError):
+    """Raised when a workflow graph cannot be safely dispatched."""
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        depends_on: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.depends_on = list(depends_on or [])
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -32,15 +44,103 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self._step_name_map: Dict[str, WorkflowStep] = {}
+        self.audit_log: List[Dict[str, str]] = []
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        if step.name in self._step_name_map:
+            self._record_decision("rejected", step.name, "duplicate_step_name")
+            raise WorkflowValidationError(f"duplicate step name: {step.name}")
         self.steps.append(step)
         self._step_map[step.id] = step
+        self._step_name_map[step.name] = step
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def validate_graph(self) -> None:
+        names = set(self._step_name_map)
+        for step in self.steps:
+            for dependency in step.depends_on:
+                if dependency not in names:
+                    self._record_decision(
+                        "rejected",
+                        step.name,
+                        "missing_dependency",
+                    )
+                    raise WorkflowValidationError(
+                        f"missing dependency {dependency!r} for {step.name!r}"
+                    )
+                if dependency == step.name:
+                    self._record_decision(
+                        "rejected",
+                        step.name,
+                        "self_dependency",
+                    )
+                    raise WorkflowValidationError(
+                        f"step cannot depend on itself: {step.name}"
+                    )
+        self._reject_cycles()
+
+    def runnable_steps(self) -> List[WorkflowStep]:
+        self.validate_graph()
+        runnable = []
+        for step in self.steps:
+            if step.status is not StepStatus.PENDING:
+                continue
+            dependencies_complete = all(
+                self._step_name_map[dependency].status is StepStatus.COMPLETED
+                for dependency in step.depends_on
+            )
+            if dependencies_complete:
+                runnable.append(step)
+
+        selected = sorted(runnable, key=lambda step: (step.name, step.id))
+        for step in selected:
+            self._record_decision("selected", step.name, "dependencies_ready")
+        return selected
+
+    def _reject_cycles(self) -> None:
+        visiting: Set[str] = set()
+        visited: Set[str] = set()
+
+        def visit(step_name: str) -> None:
+            if step_name in visiting:
+                self._record_decision(
+                    "rejected",
+                    step_name,
+                    "dependency_cycle",
+                )
+                raise WorkflowValidationError(
+                    f"dependency cycle includes {step_name!r}"
+                )
+            if step_name in visited:
+                return
+
+            visiting.add(step_name)
+            for dependency in self._step_name_map[step_name].depends_on:
+                visit(dependency)
+            visiting.remove(step_name)
+            visited.add(step_name)
+
+        for step in self.steps:
+            visit(step.name)
+
+    def _record_decision(
+        self,
+        decision: str,
+        step_name: str,
+        reason: str,
+    ) -> None:
+        self.audit_log.append(
+            {
+                "decision": decision,
+                "step": step_name,
+                "reason": reason,
+            }
+        )
 
 
 class WorkflowManager:
@@ -66,18 +166,32 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        try:
+            workflow.validate_graph()
+        except WorkflowValidationError:
+            return False
+
         workflow.status = StepStatus.RUNNING
-        for step in workflow.steps:
-            step.status = StepStatus.RUNNING
-            try:
-                result = step.handler()
-                step.result = result
-                step.status = StepStatus.COMPLETED
-            except Exception as e:
-                step.error = str(e)
-                step.status = StepStatus.FAILED
+        while any(
+            step.status is StepStatus.PENDING for step in workflow.steps
+        ):
+            runnable = workflow.runnable_steps()
+            if not runnable:
+                workflow._record_decision("deferred", "*", "no_runnable_steps")
                 workflow.status = StepStatus.FAILED
                 return False
+
+            for step in runnable:
+                step.status = StepStatus.RUNNING
+                try:
+                    result = step.handler()
+                    step.result = result
+                    step.status = StepStatus.COMPLETED
+                except Exception as e:
+                    step.error = str(e)
+                    step.status = StepStatus.FAILED
+                    workflow.status = StepStatus.FAILED
+                    return False
 
         workflow.status = StepStatus.COMPLETED
         return True
