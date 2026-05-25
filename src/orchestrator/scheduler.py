@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -33,34 +32,122 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._reconciliation_audit: List[Dict] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def _push_ready(self, task: Dict, queue: str, priority: int = 0) -> None:
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
+
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
 
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+        self._push_ready(task, queue, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+        now: Optional[float] = None,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["scheduled_at"] = now if now is not None else time.time()
+        task["retries"] = task.get("retries", 0)
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": task["scheduled_at"] + delay,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def schedule_reconciliation_jobs(
+        self,
+        agent_ids: List[str],
+        interval: float,
+        queue: str = "maintenance",
+        priority: int = 0,
+        now: Optional[float] = None,
+    ) -> List[str]:
+        if interval <= 0:
+            raise ValueError("interval must be greater than zero")
+
+        seen = set()
+        unique_agent_ids = []
+        for agent_id in agent_ids:
+            if agent_id and agent_id not in seen:
+                seen.add(agent_id)
+                unique_agent_ids.append(agent_id)
+
+        if not unique_agent_ids:
+            return []
+
+        base_time = now if now is not None else time.time()
+        stagger_step = interval / len(unique_agent_ids)
+        task_ids = []
+        for index, agent_id in enumerate(unique_agent_ids):
+            offset = index * stagger_step
+            task = {
+                "type": "reconcile",
+                "target_agent": agent_id,
+                "reconciliation": True,
+            }
+            task_id = self.schedule(
+                task,
+                offset,
+                queue=queue,
+                priority=priority,
+                now=base_time,
+            )
+            self._reconciliation_audit.append(
+                {
+                    "event": "reconciliation_scheduled",
+                    "agent_id": agent_id,
+                    "run_at": base_time + offset,
+                    "offset": offset,
+                }
+            )
+            task_ids.append(task_id)
+        return task_ids
+
+    def get_reconciliation_audit(self) -> List[Dict]:
+        return [dict(entry) for entry in self._reconciliation_audit]
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, scheduled in self._scheduled.items()
+            if scheduled["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid)
+            task = scheduled["task"]
+            task["enqueued_at"] = now
+            self._push_ready(
+                task,
+                scheduled.get("queue", queue),
+                priority=scheduled.get("priority", 0),
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()

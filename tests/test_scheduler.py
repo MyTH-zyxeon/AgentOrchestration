@@ -36,6 +36,82 @@ class TestTaskScheduler:
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
 
+    def test_scheduled_task_dequeues_after_delay(self, monkeypatch):
+        self.scheduler.schedule(
+            {"type": "delayed"},
+            delay=5.0,
+            queue="maintenance",
+            now=100.0,
+        )
+        monkeypatch.setattr(
+            "src.orchestrator.scheduler.time.time",
+            lambda: 104.0,
+        )
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue("maintenance")) is None
+
+        monkeypatch.setattr(
+            "src.orchestrator.scheduler.time.time",
+            lambda: 105.0,
+        )
+        task = asyncio.run(self.scheduler.dequeue("maintenance"))
+        assert task is not None
+        assert task["type"] == "delayed"
+
+    def test_reconciliation_jobs_are_staggered(self):
+        task_ids = self.scheduler.schedule_reconciliation_jobs(
+            ["agent-a", "agent-b", "agent-c"],
+            interval=30.0,
+            now=100.0,
+        )
+
+        assert len(task_ids) == 3
+        run_times = [
+            self.scheduler._scheduled[task_id]["run_at"]
+            for task_id in task_ids
+        ]
+        assert run_times == [100.0, 110.0, 120.0]
+        assert self.scheduler.get_reconciliation_audit() == [
+            {
+                "event": "reconciliation_scheduled",
+                "agent_id": "agent-a",
+                "run_at": 100.0,
+                "offset": 0.0,
+            },
+            {
+                "event": "reconciliation_scheduled",
+                "agent_id": "agent-b",
+                "run_at": 110.0,
+                "offset": 10.0,
+            },
+            {
+                "event": "reconciliation_scheduled",
+                "agent_id": "agent-c",
+                "run_at": 120.0,
+                "offset": 20.0,
+            },
+        ]
+
+    def test_reconciliation_jobs_deduplicate_agents(self):
+        task_ids = self.scheduler.schedule_reconciliation_jobs(
+            ["agent-a", "agent-a", "", "agent-b"],
+            interval=20.0,
+            now=200.0,
+        )
+
+        assert len(task_ids) == 2
+        assert [
+            self.scheduler._scheduled[task_id]["task"]["target_agent"]
+            for task_id in task_ids
+        ] == ["agent-a", "agent-b"]
+
+    def test_reconciliation_jobs_reject_invalid_interval(self):
+        with pytest.raises(ValueError):
+            self.scheduler.schedule_reconciliation_jobs(
+                ["agent-a"],
+                interval=0,
+            )
+
 # 2019-01-09T19:07:03 update
 
 # 2019-02-18T12:30:02 update
