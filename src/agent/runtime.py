@@ -9,6 +9,11 @@ from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+RESERVED_CHILD_ENV_KEYS = frozenset({
+    "AO_AGENT_ID",
+    "AO_AGENT_MODE",
+})
+
 
 class RuntimeState(Enum):
     STOPPED = "stopped"
@@ -23,10 +28,18 @@ class AgentRuntime:
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
 
-    def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
-        if agent_id in self._processes and self._processes[agent_id].poll() is None:
+    def start(
+        self,
+        agent_id: str,
+        command: list,
+        env: Optional[Dict] = None,
+    ) -> bool:
+        active_process = self._processes.get(agent_id)
+        if active_process and active_process.poll() is None:
             logger.warning(f"Agent {agent_id} is already running")
             return False
+
+        self._validate_child_env(env)
 
         self._states[agent_id] = RuntimeState.STARTING
         process_env = os.environ.copy()
@@ -76,6 +89,17 @@ class AgentRuntime:
     def is_running(self, agent_id: str) -> bool:
         proc = self._processes.get(agent_id)
         return proc is not None and proc.poll() is None
+
+    def _validate_child_env(self, env: Optional[Dict]) -> None:
+        if not env:
+            return
+
+        reserved_keys = sorted(RESERVED_CHILD_ENV_KEYS.intersection(env))
+        if reserved_keys:
+            joined_keys = ", ".join(reserved_keys)
+            raise ValueError(
+                f"Reserved child environment override: {joined_keys}"
+            )
 
 # 2019-01-11T10:56:26 update
 
