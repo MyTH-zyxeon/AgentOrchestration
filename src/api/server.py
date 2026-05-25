@@ -3,15 +3,19 @@
 import os
 from typing import Dict
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+
+from src.common.deployment_timeouts import DeploymentTimeouts
 
 from .routes import router
 from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
 
 
 def create_app(config: Dict = None) -> FastAPI:
+    deployment_timeouts = DeploymentTimeouts.from_config(config or {})
+
     app = FastAPI(
         title="Agent Orchestrator API",
         version="2.4.1",
@@ -19,6 +23,7 @@ def create_app(config: Dict = None) -> FastAPI:
         docs_url="/api/docs",
         redoc_url="/api/redoc",
     )
+    app.state.deployment_timeouts = deployment_timeouts
 
     app.add_middleware(
         CORSMiddleware,
@@ -28,7 +33,10 @@ def create_app(config: Dict = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","),
+    )
 
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RateLimitMiddleware)
@@ -39,6 +47,10 @@ def create_app(config: Dict = None) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "healthy", "version": "2.4.1"}
+
+    @app.get("/deployment/ingress-timeouts")
+    async def deployment_ingress_timeouts():
+        return deployment_timeouts.to_dict()
 
     return app
 
