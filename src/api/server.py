@@ -1,23 +1,29 @@
 """FastAPI application server."""
 
 import os
-from typing import Dict
+from typing import Dict, Optional
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import JSONResponse
 
-from .routes import router
+from .docs_auth import DocumentationAuthGuard
 from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
+from .routes import router
 
 
-def create_app(config: Dict = None) -> FastAPI:
+def create_app(config: Optional[Dict] = None) -> FastAPI:
+    config = config or {}
+    docs_auth = DocumentationAuthGuard(config.get("docs_auth", {}))
     app = FastAPI(
         title="Agent Orchestrator API",
         version="2.4.1",
         description="Enterprise Agent Orchestration Platform API",
-        docs_url="/api/docs",
-        redoc_url="/api/redoc",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     app.add_middleware(
@@ -28,7 +34,10 @@ def create_app(config: Dict = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","),
+    )
 
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RateLimitMiddleware)
@@ -39,6 +48,24 @@ def create_app(config: Dict = None) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "healthy", "version": "2.4.1"}
+
+    @app.get("/api/docs", include_in_schema=False)
+    async def api_docs(request: Request):
+        docs_auth.authorize(request)
+        return get_swagger_ui_html(
+            openapi_url="/api/openapi.json",
+            title=f"{app.title} - Swagger UI",
+        )
+
+    @app.get("/api/openapi.json", include_in_schema=False)
+    async def api_openapi_schema(request: Request):
+        docs_auth.authorize(request)
+        return JSONResponse(app.openapi())
+
+    @app.get("/openapi.json", include_in_schema=False)
+    async def openapi_schema(request: Request):
+        docs_auth.authorize(request)
+        return JSONResponse(app.openapi())
 
     return app
 
