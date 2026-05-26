@@ -13,6 +13,13 @@ class Config:
         self._load_env_overrides()
 
     def load(self, path: str) -> None:
+        _, extension = os.path.splitext(path)
+        if extension.lower() in {".yaml", ".yml"}:
+            raise ValueError(
+                "YAML configuration files are not supported; use a JSON "
+                "configuration file with a .json extension."
+            )
+
         with open(path) as f:
             self._data = json.load(f)
 

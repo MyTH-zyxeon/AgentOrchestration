@@ -10,6 +10,20 @@ class TestConfig:
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
 
+    def test_yaml_config_is_rejected_explicitly(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("app:\n  name: test\n")
+
+        with pytest.raises(ValueError, match="YAML configuration files"):
+            Config(str(config_file))
+
+    def test_yml_config_is_rejected_explicitly(self, tmp_path):
+        config_file = tmp_path / "config.yml"
+        config_file.write_text("app:\n  name: test\n")
+
+        with pytest.raises(ValueError, match="JSON configuration file"):
+            Config(str(config_file))
+
     def test_default_value(self):
         config = Config()
         assert config.get("nonexistent.key", "default") == "default"
