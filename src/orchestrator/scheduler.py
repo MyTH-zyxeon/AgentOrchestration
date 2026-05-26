@@ -1,10 +1,12 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -35,26 +37,60 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._task_lifecycle: Dict[str, Dict[str, Any]] = {}
+        self._reducer_errors: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["priority"] = priority
 
+        self._task_lifecycle[task_id] = {
+            "state": "queued",
+            "revision": 0,
+            "attempt": 0,
+            "updated_at": task["enqueued_at"],
+        }
+        self._push_task(task, queue, priority)
+        return task_id
+
+    def _push_task(self, task: Dict, queue: str, priority: int) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def task_state(self, task_id: str) -> Optional[Dict[str, Any]]:
+        state = self._task_lifecycle.get(task_id)
+        return dict(state) if state else None
+
+    def reducer_errors(self) -> List[Dict[str, Any]]:
+        return [dict(error) for error in self._reducer_errors]
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,21 +101,154 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task_id = task["id"]
+                if not self._commit_transition(
+                    task_id,
+                    to_state="in_flight",
+                    expected_states={"queued"},
+                    reason="dequeue",
+                ):
+                    return None
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
+    def complete(
+        self,
+        task_id: str,
+        revision: Optional[int] = None,
+        attempt: Optional[int] = None,
+    ) -> bool:
+        if not self._commit_transition(
+            task_id,
+            to_state="completed",
+            expected_states={"in_flight"},
+            revision=revision,
+            attempt=attempt,
+            reason="complete",
+        ):
+            return False
         return self._in_flight.pop(task_id, None) is not None
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        revision: Optional[int] = None,
+        attempt: Optional[int] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not task:
+            self._commit_transition(
+                task_id,
+                to_state="failed",
+                expected_states={"in_flight"},
+                revision=revision,
+                attempt=attempt,
+                reason="fail",
+            )
+            return False
+
+        task["retries"] += 1
+        retry_available = task["retries"] < self._max_retries
+        if not self._commit_transition(
+            task_id,
+            to_state="queued" if retry_available else "failed",
+            expected_states={"in_flight"},
+            revision=revision,
+            attempt=attempt,
+            reason="retry" if retry_available else "fail",
+            increment_attempt=retry_available,
+        ):
+            task["retries"] -= 1
+            return False
+
+        self._in_flight.pop(task_id, None)
+        if retry_available:
+            task["enqueued_at"] = time.time()
+            self._push_task(task, queue, priority=task.get("priority", 0))
+            return True
         return False
+
+    def _commit_transition(
+        self,
+        task_id: str,
+        to_state: str,
+        expected_states: Iterable[str],
+        revision: Optional[int] = None,
+        attempt: Optional[int] = None,
+        reason: str = "transition",
+        increment_attempt: bool = False,
+    ) -> bool:
+        lifecycle = self._task_lifecycle.get(task_id)
+        if lifecycle is None:
+            self._record_reducer_error(task_id, reason, "unknown_task")
+            return False
+
+        expected = set(expected_states)
+        if lifecycle["state"] not in expected:
+            self._record_reducer_error(
+                task_id,
+                reason,
+                "invalid_lifecycle",
+                lifecycle,
+                expected_states=sorted(expected),
+            )
+            return False
+
+        if revision is not None and revision != lifecycle["revision"]:
+            self._record_reducer_error(
+                task_id,
+                reason,
+                "stale_revision",
+                lifecycle,
+                expected_revision=revision,
+            )
+            return False
+
+        if attempt is not None and attempt != lifecycle["attempt"]:
+            self._record_reducer_error(
+                task_id,
+                reason,
+                "stale_attempt",
+                lifecycle,
+                expected_attempt=attempt,
+            )
+            return False
+
+        lifecycle["state"] = to_state
+        lifecycle["revision"] += 1
+        if increment_attempt:
+            lifecycle["attempt"] += 1
+        lifecycle["updated_at"] = time.time()
+        return True
+
+    def _record_reducer_error(
+        self,
+        task_id: str,
+        reason: str,
+        error: str,
+        lifecycle: Optional[Dict[str, Any]] = None,
+        **metadata: Any,
+    ) -> None:
+        current = dict(lifecycle or {})
+        entry = {
+            "task_id": task_id,
+            "reason": reason,
+            "error": error,
+            "state": current.get("state"),
+            "revision": current.get("revision"),
+            "attempt": current.get("attempt"),
+            "metadata": metadata,
+            "recorded_at": time.time(),
+        }
+        self._reducer_errors.append(entry)
+        logger.warning(
+            "Reducer transition rejected task_id=%s reason=%s error=%s",
+            task_id,
+            reason,
+            error,
+        )
 
 # 2019-04-25T08:37:12 update
 

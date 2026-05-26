@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,69 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_retry_preserves_task_id_and_tracks_attempt(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        retried = asyncio.run(self.scheduler.dequeue())
+        state = self.scheduler.task_state(task_id)
+
+        assert retried["id"] == task_id
+        assert state["attempt"] == 1
+        assert state["state"] == "in_flight"
+        assert self.scheduler.reducer_errors() == []
+
+    def test_stale_revision_is_recorded_separately(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        state = self.scheduler.task_state(task["id"])
+
+        assert not self.scheduler.complete(
+            task["id"],
+            revision=state["revision"] - 1,
+        )
+        errors = self.scheduler.reducer_errors()
+
+        assert self.scheduler.task_state(task["id"])["state"] == "in_flight"
+        assert errors[-1]["error"] == "stale_revision"
+        assert errors[-1]["reason"] == "complete"
+
+    def test_stale_attempt_is_recorded_separately(self):
+        self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        state = self.scheduler.task_state(task["id"])
+
+        assert not self.scheduler.fail(
+            task["id"],
+            attempt=state["attempt"] + 1,
+        )
+        errors = self.scheduler.reducer_errors()
+
+        assert self.scheduler.task_state(task["id"])["state"] == "in_flight"
+        assert errors[-1]["error"] == "stale_attempt"
+        assert errors[-1]["reason"] == "retry"
+
+    def test_invalid_lifecycle_transition_preserves_state(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+
+        assert not self.scheduler.complete(task_id)
+        errors = self.scheduler.reducer_errors()
+
+        assert self.scheduler.task_state(task_id)["state"] == "queued"
+        assert errors[-1]["error"] == "invalid_lifecycle"
+        assert errors[-1]["reason"] == "complete"
+
+    def test_unknown_task_transition_records_reducer_error(self):
+        assert not self.scheduler.complete("missing-task")
+
+        errors = self.scheduler.reducer_errors()
+        assert errors[-1]["task_id"] == "missing-task"
+        assert errors[-1]["error"] == "unknown_task"
 
 # 2019-01-09T19:07:03 update
 
