@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -39,6 +38,45 @@ class TestAgentRegistry:
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
+
+    def test_register_rejects_incompatible_plugin_dependency(self):
+        self.registry.register_plugin("search", "1.4.0")
+
+        try:
+            self.registry.register(
+                "test-agent",
+                "worker.processor",
+                config={"plugin_dependencies": {"search": ">=2.0.0"}},
+            )
+        except ValueError as exc:
+            assert "plugin dependency" in str(exc)
+        else:
+            raise AssertionError("expected incompatible dependency rejection")
+
+        assert self.registry.count() == 0
+        audit = self.registry.dependency_audit()
+        assert audit[-1]["plugin"] == "search"
+        assert audit[-1]["accepted"] is False
+
+    def test_list_filters_by_required_plugin_versions(self):
+        compatible = self.registry.register(
+            "compatible",
+            "worker.processor",
+            config={"plugins": {"vector-db": "1.4.1"}},
+        )
+        self.registry.register(
+            "stale",
+            "worker.processor",
+            config={"plugins": {"vector-db": "1.1.0"}},
+        )
+
+        resolved = self.registry.list(
+            group="worker",
+            required_plugins={"vector-db": "^1.4.0"},
+        )
+
+        assert [agent["id"] for agent in resolved] == [compatible]
+        assert self.registry.dependency_audit()[-1]["accepted"] is False
 
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")

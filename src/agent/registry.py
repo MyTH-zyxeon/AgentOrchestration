@@ -1,10 +1,12 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import logging
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class AgentStatus(Enum):
@@ -21,16 +23,137 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._plugin_versions: Dict[str, str] = {}
+        self._dependency_audit: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def _record_dependency_audit(
+        self,
+        *,
+        action: str,
+        plugin: str,
+        required: str,
+        available: Optional[str],
+        accepted: bool,
+    ) -> None:
+        event = {
+            "action": action,
+            "plugin": plugin,
+            "required": required,
+            "available": available,
+            "accepted": accepted,
+            "created_at": time.time(),
+        }
+        self._dependency_audit.append(event)
+        logger.info("registry plugin dependency decision", extra=event)
+
+    def _parse_version(self, version: str) -> Tuple[int, int, int]:
+        parts = str(version).split(".")
+        parsed = []
+        for part in parts[:3]:
+            token = ""
+            for char in part:
+                if not char.isdigit():
+                    break
+                token += char
+            parsed.append(int(token or 0))
+        while len(parsed) < 3:
+            parsed.append(0)
+        return tuple(parsed)  # type: ignore[return-value]
+
+    def _version_matches(self, available: str, requirement: str) -> bool:
+        requirement = str(requirement).strip()
+        if not requirement:
+            return True
+
+        if requirement.startswith("^"):
+            minimum = self._parse_version(requirement[1:])
+            current = self._parse_version(available)
+            upper = (minimum[0] + 1, 0, 0)
+            return minimum <= current < upper
+
+        for operator in (">=", "<=", "==", ">", "<"):
+            if requirement.startswith(operator):
+                expected = self._parse_version(requirement[len(operator):])
+                current = self._parse_version(available)
+                if operator == ">=":
+                    return current >= expected
+                if operator == "<=":
+                    return current <= expected
+                if operator == "==":
+                    return current == expected
+                if operator == ">":
+                    return current > expected
+                if operator == "<":
+                    return current < expected
+
+        return (
+            self._parse_version(available)
+            == self._parse_version(requirement)
+        )
+
+    def _plugin_catalog(self, config: Dict[str, Any]) -> Dict[str, str]:
+        catalog = dict(self._plugin_versions)
+        for key in ("plugins", "plugin_versions"):
+            value = config.get(key)
+            if isinstance(value, dict):
+                catalog.update({str(name): str(version)
+                                for name, version in value.items()})
+        return catalog
+
+    def _dependencies_satisfied(
+        self,
+        dependencies: Dict[str, str],
+        catalog: Dict[str, str],
+        *,
+        action: str,
+    ) -> bool:
+        accepted = True
+        for plugin, requirement in dependencies.items():
+            available = catalog.get(str(plugin))
+            matches = (
+                available is not None
+                and self._version_matches(available, str(requirement))
+            )
+            self._record_dependency_audit(
+                action=action,
+                plugin=str(plugin),
+                required=str(requirement),
+                available=available,
+                accepted=matches,
+            )
+            if not matches:
+                accepted = False
+        return accepted
+
+    def register_plugin(self, name: str, version: str) -> None:
+        self._plugin_versions[str(name)] = str(version)
+
+    def dependency_audit(self) -> List[Dict[str, Any]]:
+        return list(self._dependency_audit)
+
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
+        agent_config = config or {}
+        plugin_dependencies = agent_config.get("plugin_dependencies", {})
+        if isinstance(plugin_dependencies, dict):
+            if not self._dependencies_satisfied(
+                {str(k): str(v) for k, v in plugin_dependencies.items()},
+                self._plugin_catalog(agent_config),
+                action="register",
+            ):
+                raise ValueError("plugin dependency versions are incompatible")
         self._agents[agent_id] = {
             "id": agent_id,
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": agent_config,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -45,13 +168,27 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+        required_plugins: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
         if group:
             agent_ids = self._index.get(group, [])
             agents = [a for a in agents if a["id"] in agent_ids]
+        if required_plugins:
+            agents = [
+                a for a in agents
+                if self._dependencies_satisfied(
+                    {str(k): str(v) for k, v in required_plugins.items()},
+                    self._plugin_catalog(a.get("config", {})),
+                    action="resolve",
+                )
+            ]
         return list(agents)
 
     def update_status(self, agent_id: str, status: AgentStatus) -> bool:
