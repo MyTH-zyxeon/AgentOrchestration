@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -47,6 +46,24 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_delete_emits_sanitized_deregister_event(self):
+        events = []
+        self.registry.add_change_listener(events.append)
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            config={"token": "secret-value"},
+        )
+
+        assert self.registry.delete(agent_id)
+
+        event = events[-1]
+        assert event["action"] == "deregistered"
+        assert event["agent_id"] == agent_id
+        assert event["group"] == "worker"
+        assert "config" not in event
+        assert "metrics" not in event
 
 # 2019-01-23T10:28:57 update
 

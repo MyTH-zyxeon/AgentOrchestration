@@ -1,5 +1,6 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.agent.registry import AgentRegistry
+from src.orchestrator.scheduler import RetiredHandlerError, TaskScheduler
 
 
 class TestTaskScheduler:
@@ -35,6 +36,52 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_registry_deregistration_retires_handler_tasks(self):
+        registry = AgentRegistry()
+        self.scheduler.bind_registry(registry)
+        retired_handler = registry.register("agent-1", "worker.processor")
+        active_handler = registry.register("agent-2", "worker.processor")
+        self.scheduler.enqueue({
+            "type": "queued",
+            "handler_id": retired_handler,
+        })
+        self.scheduler.enqueue({"type": "kept", "handler_id": active_handler})
+        self.scheduler.schedule(
+            {"type": "scheduled", "handler_id": retired_handler},
+            delay=60,
+        )
+        in_flight_id = self.scheduler.enqueue(
+            {"type": "running", "handler_id": retired_handler},
+            priority=10,
+        )
+        import asyncio
+        running = asyncio.run(self.scheduler.dequeue())
+        assert running["id"] == in_flight_id
+
+        assert registry.delete(retired_handler)
+
+        remaining = asyncio.run(self.scheduler.dequeue())
+        assert remaining["type"] == "kept"
+        assert not self.scheduler.complete(in_flight_id)
+        audit = self.scheduler.audit_records()[-1]
+        assert audit["action"] == "handler_retired"
+        assert audit["handler_id"] == retired_handler
+        assert audit["removed_queued"] == 1
+        assert audit["removed_scheduled"] == 1
+        assert audit["removed_in_flight"] == 1
+        assert "payload" not in audit
+
+    def test_rejects_new_tasks_for_retired_handler(self):
+        handler_id = "handler-1"
+        self.scheduler.retire_handler(handler_id)
+
+        with pytest.raises(RetiredHandlerError):
+            self.scheduler.enqueue({"type": "new", "handler_id": handler_id})
+
+        audit = self.scheduler.audit_records()[-1]
+        assert audit["action"] == "task_rejected"
+        assert audit["reason"] == "handler_retired"
 
 # 2019-01-09T19:07:03 update
 
