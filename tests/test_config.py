@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,27 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_env_override_coerces_false_boolean(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "false")
+
+        config = Config()
+
+        assert config.get("feature.enabled") is False
+
+    def test_env_override_coerces_true_boolean(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", " TRUE ")
+
+        config = Config()
+
+        assert config.get("feature.enabled") is True
+
+    def test_env_override_preserves_non_boolean_string(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "disabled")
+
+        config = Config()
+
+        assert config.get("feature.enabled") == "disabled"
 
 # 2019-02-01T18:58:35 update
 
