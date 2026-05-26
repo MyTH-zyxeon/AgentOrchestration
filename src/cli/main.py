@@ -3,31 +3,75 @@
 import argparse
 import sys
 
-from src.common.config import Config
 from src.common.logging import configure_logging
 
+SUPPORTED_OUTPUT_MODES = ("text", "json", "table", "yaml")
+DEFAULT_OUTPUT_MODE = "text"
 
-def cli():
+
+def add_output_argument(parser, *, default=DEFAULT_OUTPUT_MODE):
+    parser.add_argument(
+        "--output",
+        "-o",
+        choices=SUPPORTED_OUTPUT_MODES,
+        default=default,
+        help="Output mode",
+    )
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
+    add_output_argument(parser)
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+    )
 
-    init_parser = subparsers.add_parser("init", help="Initialize a new project")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize a new project",
+    )
     init_parser.add_argument("name", help="Project name")
+    add_output_argument(init_parser, default=argparse.SUPPRESS)
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
+    add_output_argument(deploy_parser, default=argparse.SUPPRESS)
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
-    status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Watch mode",
+    )
+    add_output_argument(status_parser, default=argparse.SUPPRESS)
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help="Number of lines",
+    )
+    add_output_argument(logs_parser, default=argparse.SUPPRESS)
 
-    args = parser.parse_args()
+    return parser
+
+
+def cli(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     if args.verbose:
         configure_logging("DEBUG")
