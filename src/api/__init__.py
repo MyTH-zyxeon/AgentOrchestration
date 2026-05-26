@@ -2,8 +2,14 @@
 
 from .server import create_app
 from .routes import router
+from .webhooks import WebhookDeliveryRejected, WebhookEndpointStore
 
-__all__ = ["create_app", "router"]
+__all__ = [
+    "create_app",
+    "router",
+    "WebhookDeliveryRejected",
+    "WebhookEndpointStore",
+]
 
 # 2019-02-04T12:25:11 update
 
