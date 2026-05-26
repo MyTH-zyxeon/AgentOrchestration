@@ -1,25 +1,79 @@
 """Agent Sandbox — Isolated execution environment for agents."""
 
-import os
 import tempfile
-import resource
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - platform-specific fallback
+    resource = None
+
+
+def _positive_integer(name: str, value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    if isinstance(value, int):
+        numeric_value = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        numeric_value = int(value.strip())
+    else:
+        raise ValueError(f"{name} must be a positive integer")
+
+    if numeric_value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return numeric_value
 
 
 class ResourceLimits:
-    def __init__(self, cpu_time: int = 60, memory_mb: int = 512, disk_mb: int = 100):
-        self.cpu_time = cpu_time
-        self.memory_mb = memory_mb
-        self.disk_mb = disk_mb
+    DEFAULT_CPU_TIME = 60
+    DEFAULT_MEMORY_MB = 512
+    DEFAULT_DISK_MB = 100
+
+    def __init__(
+        self,
+        cpu_time: int = DEFAULT_CPU_TIME,
+        memory_mb: int = DEFAULT_MEMORY_MB,
+        disk_mb: int = DEFAULT_DISK_MB,
+    ):
+        self.cpu_time = _positive_integer("cpu_time", cpu_time)
+        self.memory_mb = _positive_integer("memory_mb", memory_mb)
+        self.disk_mb = _positive_integer("disk_mb", disk_mb)
+
+    @classmethod
+    def from_config(
+        cls,
+        config: Any,
+        prefix: str = "sandbox.resource_limits",
+    ) -> "ResourceLimits":
+        env_prefix = "sandbox.resource.limits"
+        return cls(
+            cpu_time=config.get(
+                f"{prefix}.cpu_time",
+                config.get(f"{env_prefix}.cpu.time", cls.DEFAULT_CPU_TIME),
+            ),
+            memory_mb=config.get(
+                f"{prefix}.memory_mb",
+                config.get(f"{env_prefix}.memory.mb", cls.DEFAULT_MEMORY_MB),
+            ),
+            disk_mb=config.get(
+                f"{prefix}.disk_mb",
+                config.get(f"{env_prefix}.disk.mb", cls.DEFAULT_DISK_MB),
+            ),
+        )
 
 
 class AgentSandbox:
     def __init__(self, base_path: Optional[str] = None):
-        self.base_path = Path(base_path or tempfile.mkdtemp(prefix="ao_sandbox_"))
+        sandbox_root = base_path or tempfile.mkdtemp(prefix="ao_sandbox_")
+        self.base_path = Path(sandbox_root)
         self._sandboxes: Dict[str, Path] = {}
 
-    def create(self, agent_id: str, limits: Optional[ResourceLimits] = None) -> Path:
+    def create(
+        self,
+        agent_id: str,
+        limits: Optional[ResourceLimits] = None,
+    ) -> Path:
         sandbox_path = self.base_path / agent_id
         sandbox_path.mkdir(parents=True, exist_ok=True)
         self._sandboxes[agent_id] = sandbox_path
@@ -37,11 +91,17 @@ class AgentSandbox:
         return self._sandboxes.get(agent_id)
 
     def apply_limits(self, agent_id: str, limits: ResourceLimits) -> None:
+        if resource is None:
+            return
+
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_time, limits.cpu_time))
+            resource.setrlimit(
+                resource.RLIMIT_CPU,
+                (limits.cpu_time, limits.cpu_time),
+            )
             mem_bytes = limits.memory_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        except (ValueError, resource.error) as e:
+        except (ValueError, resource.error):
             pass
 
     def cleanup_all(self) -> None:

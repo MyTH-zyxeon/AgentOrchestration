@@ -1,5 +1,6 @@
 import pytest
 from src.common.config import Config
+from src.agent.sandbox import ResourceLimits
 
 
 class TestConfig:
@@ -31,6 +32,56 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_get_sandbox_resource_limits(self):
+        config = Config()
+        config.set("sandbox.resource_limits.cpu_time", 30)
+        config.set("sandbox.resource_limits.memory_mb", 256)
+        config.set("sandbox.resource_limits.disk_mb", 64)
+
+        limits = config.get_sandbox_resource_limits()
+
+        assert limits.cpu_time == 30
+        assert limits.memory_mb == 256
+        assert limits.disk_mb == 64
+
+    def test_get_sandbox_resource_limits_reads_env_strings(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("AO_SANDBOX_RESOURCE_LIMITS_CPU_TIME", "45")
+        monkeypatch.setenv("AO_SANDBOX_RESOURCE_LIMITS_MEMORY_MB", "768")
+        monkeypatch.setenv("AO_SANDBOX_RESOURCE_LIMITS_DISK_MB", "128")
+
+        limits = Config().get_sandbox_resource_limits()
+
+        assert limits.cpu_time == 45
+        assert limits.memory_mb == 768
+        assert limits.disk_mb == 128
+
+    @pytest.mark.parametrize(
+        ("key", "value", "name"),
+        [
+            ("sandbox.resource_limits.cpu_time", -1, "cpu_time"),
+            ("sandbox.resource_limits.memory_mb", 0, "memory_mb"),
+            ("sandbox.resource_limits.disk_mb", "large", "disk_mb"),
+        ],
+    )
+    def test_get_sandbox_resource_limits_rejects_invalid_values(
+        self,
+        key,
+        value,
+        name,
+    ):
+        config = Config()
+        config.set(key, value)
+
+        with pytest.raises(ValueError, match=name):
+            config.get_sandbox_resource_limits()
+
+    def test_resource_limits_rejects_boolean_values(self):
+        with pytest.raises(ValueError, match="cpu_time"):
+            ResourceLimits(cpu_time=True)
 
 # 2019-02-01T18:58:35 update
 
