@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -39,6 +38,38 @@ class TestAgentRegistry:
         assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
         agent = self.registry.get(agent_id)
         assert agent["status"] == "running"
+
+    def test_resolve_handlers_filters_by_locality_and_status(self):
+        east = self.registry.register(
+            "east-worker",
+            "worker.processor",
+            config={"locality": "us-east"},
+        )
+        west = self.registry.register(
+            "west-worker",
+            "worker.processor",
+            config={"locality": "us-west"},
+        )
+        self.registry.update_status(east, AgentStatus.RUNNING)
+        self.registry.update_status(west, AgentStatus.RUNNING)
+
+        resolved = self.registry.resolve_handlers(locality="us-east")
+        assert [agent["id"] for agent in resolved] == [east]
+
+    def test_resolve_handlers_invalidates_cache_on_lifecycle_change(self):
+        agent_id = self.registry.register(
+            "east-worker",
+            "worker.processor",
+            config={"locality": "us-east"},
+        )
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        assert [
+            a["id"] for a in self.registry.resolve_handlers(locality="us-east")
+        ] == [agent_id]
+
+        self.registry.update_status(agent_id, AgentStatus.STOPPED)
+        assert self.registry.resolve_handlers(locality="us-east") == []
 
     def test_delete_agent(self):
         agent_id = self.registry.register("test-agent", "worker.processor")

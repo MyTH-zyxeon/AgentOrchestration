@@ -1,10 +1,12 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import logging
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class AgentStatus(Enum):
@@ -21,16 +23,42 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._locality_cache: Dict[Tuple[str, str, str], List[str]] = {}
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def _invalidate_locality_cache(
+        self,
+        *,
+        locality: Optional[str] = None,
+        group: Optional[str] = None,
+    ) -> None:
+        if locality is None and group is None:
+            self._locality_cache.clear()
+            return
+
+        keys = list(self._locality_cache.keys())
+        for key in keys:
+            cached_locality, cached_group, _cached_status = key
+            if locality is not None and cached_locality != locality:
+                continue
+            if group is not None and cached_group != group:
+                continue
+            self._locality_cache.pop(key, None)
+
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
+        agent_config = config or {}
         self._agents[agent_id] = {
             "id": agent_id,
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": agent_config,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -40,12 +68,20 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._invalidate_locality_cache(
+            locality=agent_config.get("locality"),
+            group=group,
+        )
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -59,6 +95,12 @@ class AgentRegistry:
             return False
         self._agents[agent_id]["status"] = status.value
         self._agents[agent_id]["updated_at"] = time.time()
+        agent = self._agents[agent_id]
+        group = agent["type"].split(".")[0]
+        self._invalidate_locality_cache(
+            locality=agent.get("config", {}).get("locality"),
+            group=group,
+        )
         return True
 
     def delete(self, agent_id: str) -> bool:
@@ -68,10 +110,72 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_locality_cache(
+            locality=agent.get("config", {}).get("locality"),
+            group=group,
+        )
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def resolve_handlers(
+        self,
+        *,
+        locality: str,
+        group: str = "worker",
+        status: AgentStatus = AgentStatus.RUNNING,
+    ) -> List[Dict[str, Any]]:
+        cache_key = (locality, group, status.value)
+        cached_ids = self._locality_cache.get(cache_key)
+
+        if cached_ids is not None:
+            resolved: List[Dict[str, Any]] = []
+            stale = False
+            for agent_id in cached_ids:
+                agent = self._agents.get(agent_id)
+                if agent is None:
+                    stale = True
+                    continue
+                if agent["type"].split(".")[0] != group:
+                    stale = True
+                    continue
+                if agent["status"] != status.value:
+                    stale = True
+                    continue
+                if agent.get("config", {}).get("locality") != locality:
+                    stale = True
+                    continue
+                resolved.append(agent)
+            if not stale:
+                return resolved
+
+            logger.info(
+                "registry locality cache stale; recomputing",
+                extra={
+                    "locality": locality,
+                    "group": group,
+                    "status": status.value,
+                },
+            )
+            self._locality_cache.pop(cache_key, None)
+
+        agent_ids = self._index.get(group, [])
+        eligible: List[str] = []
+        resolved_agents: List[Dict[str, Any]] = []
+        for agent_id in agent_ids:
+            agent = self._agents.get(agent_id)
+            if agent is None:
+                continue
+            if agent["status"] != status.value:
+                continue
+            if agent.get("config", {}).get("locality") != locality:
+                continue
+            eligible.append(agent_id)
+            resolved_agents.append(agent)
+
+        self._locality_cache[cache_key] = eligible
+        return resolved_agents
 
 # 2019-01-29T11:24:49 update
 
