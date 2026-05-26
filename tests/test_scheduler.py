@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,53 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_priority_class_budget_defers_urgent_lane(self):
+        scheduler = TaskScheduler(priority_class_limits={"urgent": 1})
+        scheduler.enqueue({"type": "urgent-1"}, priority=10)
+        scheduler.enqueue({"type": "urgent-2"}, priority=10)
+        scheduler.enqueue({"type": "normal"}, priority=1)
+
+        first = asyncio.run(scheduler.dequeue())
+        second = asyncio.run(scheduler.dequeue())
+
+        assert first["type"] == "urgent-1"
+        assert second["type"] == "normal"
+        assert scheduler.audit_log()[-1]["event"] == "deferred"
+        assert scheduler.audit_log()[-1]["priority_class"] == "urgent"
+
+        assert scheduler.complete(first["id"])
+        third = asyncio.run(scheduler.dequeue())
+        assert third["type"] == "urgent-2"
+
+    def test_priority_class_budget_is_released_on_fail(self):
+        scheduler = TaskScheduler(priority_class_limits={"urgent": 1})
+        scheduler.enqueue({"type": "urgent-1"}, priority=10)
+        scheduler.enqueue({"type": "urgent-2"}, priority=10)
+
+        first = asyncio.run(scheduler.dequeue())
+        assert first["type"] == "urgent-1"
+        assert scheduler.fail(first["id"])
+
+        next_urgent = asyncio.run(scheduler.dequeue())
+        assert next_urgent["type"] == "urgent-2"
+
+        assert scheduler.complete(next_urgent["id"])
+        retry = asyncio.run(scheduler.dequeue())
+        assert retry["type"] == "urgent-1"
+        assert retry["retries"] == 1
 
 # 2019-01-09T19:07:03 update
 
