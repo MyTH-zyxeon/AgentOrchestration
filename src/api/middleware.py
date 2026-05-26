@@ -2,7 +2,7 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Dict, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,9 +10,98 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+class ProxyForwardedHeaderMiddleware(BaseHTTPMiddleware):
+    _STATE_KEY = "proxy_forwarded_header_decision"
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        try:
+            conflict = self._find_forwarded_conflict(request)
+            request.state.proxy_forwarded_header_decision = (
+                "rejected" if conflict else "accepted"
+            )
+            if conflict:
+                logger.warning(
+                    "Rejected request with conflicting proxy headers"
+                )
+                return Response(
+                    status_code=400,
+                    content="Conflicting forwarded headers",
+                    headers={
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+            return await call_next(request)
+        finally:
+            if hasattr(request.state, self._STATE_KEY):
+                delattr(request.state, self._STATE_KEY)
+
+    def _find_forwarded_conflict(self, request: Request) -> bool:
+        forwarded = self._parse_forwarded(request.headers.get("Forwarded"))
+        if not forwarded:
+            return False
+
+        comparisons = {
+            "for": request.headers.get("X-Forwarded-For"),
+            "proto": request.headers.get("X-Forwarded-Proto"),
+            "host": request.headers.get("X-Forwarded-Host"),
+        }
+        for forwarded_key, x_forwarded_value in comparisons.items():
+            if self._values_conflict(
+                forwarded.get(forwarded_key),
+                x_forwarded_value,
+            ):
+                return True
+        return False
+
+    def _parse_forwarded(self, header_value: Optional[str]) -> Dict[str, str]:
+        if not header_value:
+            return {}
+
+        first_hop = header_value.split(",", 1)[0]
+        parsed: Dict[str, str] = {}
+        for segment in first_hop.split(";"):
+            if "=" not in segment:
+                continue
+            key, value = segment.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip().strip('"')
+            if key:
+                parsed[key] = value
+        return parsed
+
+    def _values_conflict(
+        self,
+        forwarded_value: Optional[str],
+        x_forwarded_value: Optional[str],
+    ) -> bool:
+        if not forwarded_value or not x_forwarded_value:
+            return False
+
+        first_x_value = x_forwarded_value.split(",", 1)[0]
+        return (
+            self._normalize_header_value(forwarded_value)
+            != self._normalize_header_value(first_x_value)
+        )
+
+    def _normalize_header_value(self, value: str) -> str:
+        return value.strip().strip('"').lower()
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +115,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            timestamp
+            for timestamp in self._requests[client_ip]
+            if now - timestamp < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +140,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
