@@ -1,5 +1,6 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import inspect
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -14,12 +15,21 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        parameters: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.parameter_defaults = dict(parameters or {})
+        self.parameters = dict(self.parameter_defaults)
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,6 +43,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_events: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -61,16 +72,68 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
-    def execute_workflow(self, workflow_id: str) -> bool:
+    def bind_workflow_parameters(
+        self,
+        workflow_id: str,
+        runtime_parameters: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
+            return False
+
+        runtime_parameters = runtime_parameters or {}
+        if workflow.status is not StepStatus.PENDING:
+            workflow.audit_events.append({
+                "event": "parameter_binding_deferred",
+                "workflow_id": workflow.id,
+                "status": workflow.status.value,
+                "step_ids": [step.id for step in workflow.steps],
+            })
+            return False
+
+        for step in workflow.steps:
+            overrides = runtime_parameters.get(step.id, {})
+            if overrides is None:
+                overrides = {}
+            if not isinstance(overrides, dict):
+                workflow.audit_events.append({
+                    "event": "parameter_binding_rejected",
+                    "workflow_id": workflow.id,
+                    "step_id": step.id,
+                    "reason": "non_dict_overrides",
+                })
+                return False
+
+            step.parameters = self._merge_parameters(
+                step.parameter_defaults,
+                overrides,
+            )
+            workflow.audit_events.append({
+                "event": "parameter_binding_applied",
+                "workflow_id": workflow.id,
+                "step_id": step.id,
+                "default_keys": sorted(step.parameter_defaults),
+                "override_keys": sorted(overrides),
+                "bound_keys": sorted(step.parameters),
+            })
+        return True
+
+    def execute_workflow(
+        self,
+        workflow_id: str,
+        runtime_parameters: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> bool:
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return False
+        if not self.bind_workflow_parameters(workflow_id, runtime_parameters):
             return False
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
-                result = step.handler()
+                result = self._invoke_handler(step)
                 step.result = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
@@ -81,6 +144,24 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    @staticmethod
+    def _merge_parameters(
+        defaults: Dict[str, Any],
+        overrides: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        merged = dict(defaults)
+        for key, value in overrides.items():
+            if value is not None:
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _invoke_handler(step: WorkflowStep) -> Any:
+        signature = inspect.signature(step.handler)
+        if len(signature.parameters) == 0:
+            return step.handler()
+        return step.handler(dict(step.parameters))
 
 # 2019-03-27T19:58:07 update
 
