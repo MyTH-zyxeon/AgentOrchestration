@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,65 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_retry_preserves_task_id(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        retried = asyncio.run(self.scheduler.dequeue())
+
+        assert retried["id"] == task_id
+
+    def test_schedule_uses_monotonic_time_when_wall_clock_moves_back(self):
+        wall_clock = [1000.0]
+        monotonic_clock = [10.0]
+        scheduler = TaskScheduler(
+            clock=lambda: wall_clock[0],
+            monotonic_clock=lambda: monotonic_clock[0],
+        )
+        task_id = scheduler.schedule({"type": "heartbeat"}, delay=5.0)
+
+        wall_clock[0] = 900.0
+        monotonic_clock[0] = 15.0
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert task["type"] == "heartbeat"
+
+    def test_wall_clock_forward_skew_is_audited_and_deferred(self):
+        wall_clock = [1000.0]
+        monotonic_clock = [10.0]
+        scheduler = TaskScheduler(
+            clock=lambda: wall_clock[0],
+            monotonic_clock=lambda: monotonic_clock[0],
+        )
+        task_id = scheduler.schedule(
+            {"type": "heartbeat"},
+            delay=5.0,
+            queue="heartbeats",
+            priority=3,
+        )
+
+        wall_clock[0] = 2000.0
+        monotonic_clock[0] = 12.0
+
+        import asyncio
+        assert asyncio.run(scheduler.dequeue("heartbeats")) is None
+        audit = scheduler.heartbeat_audit()
+
+        assert audit[-1]["task_id"] == task_id
+        assert audit[-1]["decision"] == "defer_wall_clock_skew"
+        assert audit[-1]["queue"] == "heartbeats"
+        assert audit[-1]["priority"] == 3
+
+        monotonic_clock[0] = 15.0
+        task = asyncio.run(scheduler.dequeue("heartbeats"))
+
+        assert task["id"] == task_id
 
 # 2019-01-09T19:07:03 update
 

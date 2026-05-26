@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -31,36 +30,95 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.time,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._heartbeat_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
+        self._clock = clock
+        self._monotonic_clock = monotonic_clock
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
+        task["enqueued_at"] = self._clock()
         task["retries"] = 0
+        task["priority"] = priority
 
+        self._push_task(task, queue, priority)
+        return task_id
+
+    def _push_task(self, task: Dict, queue: str, priority: int) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        wall_now = self._clock()
+        monotonic_now = self._monotonic_clock()
+        self._scheduled[task_id] = {
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+            "wall_deadline": wall_now + delay,
+            "monotonic_deadline": monotonic_now + delay,
+            "wall_skew_recorded": False,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    def heartbeat_audit(self) -> List[Dict[str, Any]]:
+        return [dict(entry) for entry in self._heartbeat_audit]
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._monotonic_clock()
+        expired = [
+            tid for tid, record in self._scheduled.items()
+            if record["monotonic_deadline"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
+            record = self._scheduled.pop(tid)
+            task = record["task"]
             if task:
-                self.enqueue(task, queue)
+                task["enqueued_at"] = self._clock()
+                task["retries"] = task.get("retries", 0)
+                task["priority"] = record["priority"]
+                self._push_task(task, record["queue"], record["priority"])
+
+        wall_now = self._clock()
+        for tid, record in self._scheduled.items():
+            if (
+                not record["wall_skew_recorded"]
+                and record["wall_deadline"] <= wall_now
+            ):
+                self._record_heartbeat_audit(
+                    task_id=tid,
+                    decision="defer_wall_clock_skew",
+                    queue=record["queue"],
+                    priority=record["priority"],
+                )
+                record["wall_skew_recorded"] = True
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -77,9 +135,28 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                priority = task.get("priority", 0)
+                task["enqueued_at"] = self._clock()
+                self._push_task(task, queue, priority=priority)
                 return True
         return False
+
+    def _record_heartbeat_audit(
+        self,
+        task_id: str,
+        decision: str,
+        queue: str,
+        priority: int,
+    ) -> None:
+        self._heartbeat_audit.append(
+            {
+                "task_id": task_id,
+                "decision": decision,
+                "queue": queue,
+                "priority": priority,
+                "recorded_at": self._clock(),
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 
