@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 from uuid import uuid4
 
 
@@ -33,52 +32,168 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._queued_task_ids: Set[str] = set()
+        self._terminal_task_ids: Set[str] = set()
+        self._task_ids_by_key: Dict[str, str] = {}
+        self._keys_by_task_id: Dict[str, str] = {}
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        key = self._dedupe_key(task)
+        existing_task_id = self._existing_task_id(key)
+        if existing_task_id:
+            return existing_task_id
+
+        return self._queue_task(task, queue, priority, key)
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        key = self._dedupe_key(task)
+        existing_task_id = self._existing_task_id(key)
+        due_at = time.time() + delay
+
+        if existing_task_id:
+            if existing_task_id in self._scheduled:
+                entry = self._scheduled[existing_task_id]
+                entry["due_at"] = min(entry["due_at"], due_at)
+                entry["priority"] = max(entry["priority"], priority)
+            return existing_task_id
+
+        task_id = task.get("id") or str(uuid4())
+        task["id"] = task_id
+        task["scheduled_for"] = due_at
+        task["priority"] = priority
+        task.setdefault("retries", 0)
+        self._register_task_key(task_id, key)
+        self._scheduled[task_id] = {
+            "task": task,
+            "due_at": due_at,
+            "queue": queue,
+            "priority": priority,
+            "key": key,
+        }
+        return task_id
+
+    def _queue_task(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int,
+        key: Optional[str],
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
+        if (
+            task_id in self._queued_task_ids
+            or task_id in self._in_flight
+            or task_id in self._terminal_task_ids
+        ):
+            return task_id
+
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
-
+        task["priority"] = priority
+        task.setdefault("retries", 0)
+        self._register_task_key(task_id, key)
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
+        self._queued_task_ids.add(task_id)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
-        return task_id
+    def _dedupe_key(self, task: Dict) -> Optional[str]:
+        for field in ("schedule_key", "idempotency_key", "run_id"):
+            value = task.get(field)
+            if value is not None:
+                return str(value)
+        return None
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def _existing_task_id(self, key: Optional[str]) -> Optional[str]:
+        if key is None:
+            return None
+
+        task_id = self._task_ids_by_key.get(key)
+        if task_id is None:
+            return None
+
+        if (
+            task_id in self._scheduled
+            or task_id in self._queued_task_ids
+            or task_id in self._in_flight
+            or task_id in self._terminal_task_ids
+        ):
+            return task_id
+
+        self._task_ids_by_key.pop(key, None)
+        self._keys_by_task_id.pop(task_id, None)
+        return None
+
+    def _register_task_key(self, task_id: str, key: Optional[str]) -> None:
+        if key is None:
+            return
+        self._task_ids_by_key.setdefault(key, task_id)
+        self._keys_by_task_id[task_id] = key
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, entry in self._scheduled.items()
+            if entry["due_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            entry = self._scheduled.pop(tid)
+            self._queue_task(
+                entry["task"],
+                entry["queue"],
+                entry["priority"],
+                entry["key"],
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                self._queued_task_ids.discard(task["id"])
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task is None:
+            return False
+        self._terminal_task_ids.add(task_id)
+        return True
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                key = self._keys_by_task_id.get(task_id)
+                self._queue_task(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                    key=key,
+                )
                 return True
+            self._terminal_task_ids.add(task_id)
         return False
 
 # 2019-04-25T08:37:12 update
