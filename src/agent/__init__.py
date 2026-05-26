@@ -1,11 +1,19 @@
 """Agent lifecycle management module."""
 
-from .registry import AgentRegistry
+from .registry import AgentRegistry, AgentStatus
 from .executor import AgentExecutor
 from .runtime import AgentRuntime
 from .sandbox import AgentSandbox
+from .identity import IdentityGroupRoleMapper
 
-__all__ = ["AgentRegistry", "AgentExecutor", "AgentRuntime", "AgentSandbox"]
+__all__ = [
+    "AgentRegistry",
+    "AgentStatus",
+    "AgentExecutor",
+    "AgentRuntime",
+    "AgentSandbox",
+    "IdentityGroupRoleMapper",
+]
 
 # 2019-02-05T12:34:30 update
 
