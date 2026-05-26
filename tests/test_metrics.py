@@ -31,6 +31,32 @@ class TestMetricsCollector:
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
 
+    def test_snapshot_redacts_sensitive_metric_name_segments(self):
+        self.metrics.increment("requests.prod-us-east-1.customer@example.com")
+
+        snapshot = self.metrics.snapshot()
+        exported_name = next(iter(snapshot["counters"]))
+
+        assert snapshot["counters"][exported_name] == 1
+        assert "prod-us-east-1" not in exported_name
+        assert "customer@example.com" not in exported_name
+        assert exported_name.startswith("requests._redacted._redacted.")
+
+    def test_snapshot_uses_custom_metric_name_sanitizer(self):
+        metrics = MetricsCollector(name_sanitizer=lambda name: "safe_" + name)
+        metrics.gauge("worker.active", 3)
+
+        snapshot = metrics.snapshot()
+
+        assert snapshot["gauges"]["safe_worker.active"] == 3
+
+    def test_rejects_empty_metric_name(self):
+        with pytest.raises(
+            ValueError,
+            match="metric name must be a non-empty string",
+        ):
+            self.metrics.increment("")
+
 # 2019-07-16T09:29:21 update
 
 # 2019-09-09T13:35:42 update

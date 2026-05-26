@@ -1,36 +1,55 @@
 """Metrics collection and reporting."""
 
+import hashlib
+import re
 import time
 from collections import defaultdict
-from typing import Dict, List
-from threading import Lock
+from threading import RLock
+from typing import Callable, Dict, List, Optional
+
+
+_SAFE_METRIC_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
+_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SENSITIVE_SEGMENT_RE = re.compile(
+    r"@|/|\\|=|[0-9a-f]{8}-[0-9a-f-]{27}|[A-Za-z]+-[A-Za-z]+-[0-9]+",
+    re.IGNORECASE,
+)
 
 
 class MetricsCollector:
-    def __init__(self):
-        self._lock = Lock()
+    def __init__(
+        self,
+        name_sanitizer: Optional[Callable[[str], str]] = None,
+    ):
+        self._lock = RLock()
+        self._name_sanitizer = name_sanitizer or self._sanitize_metric_name
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
         self._histograms: Dict[str, List[float]] = defaultdict(list)
         self._timers: Dict[str, float] = {}
 
     def increment(self, metric: str, value: int = 1) -> None:
+        self._validate_metric_name(metric)
         with self._lock:
             self._counters[metric] += value
 
     def gauge(self, metric: str, value: float) -> None:
+        self._validate_metric_name(metric)
         with self._lock:
             self._gauges[metric] = value
 
     def observe(self, metric: str, value: float) -> None:
+        self._validate_metric_name(metric)
         with self._lock:
             self._histograms[metric].append(value)
 
     def start_timer(self, metric: str) -> None:
+        self._validate_metric_name(metric)
         with self._lock:
             self._timers[metric] = time.time()
 
     def stop_timer(self, metric: str) -> float:
+        self._validate_metric_name(metric)
         with self._lock:
             if metric in self._timers:
                 duration = time.time() - self._timers.pop(metric)
@@ -41,11 +60,58 @@ class MetricsCollector:
     def snapshot(self) -> Dict:
         with self._lock:
             return {
-                "counters": dict(self._counters),
-                "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "counters": {
+                    self._export_metric_name(k): v
+                    for k, v in self._counters.items()
+                },
+                "gauges": {
+                    self._export_metric_name(k): v
+                    for k, v in self._gauges.items()
+                },
+                "histograms": {
+                    self._export_metric_name(k): {
+                        "count": len(v),
+                        "sum": sum(v),
+                        "avg": sum(v) / len(v) if v else 0,
+                    }
+                    for k, v in self._histograms.items()
+                },
             }
+
+    def _export_metric_name(self, metric: str) -> str:
+        sanitized = self._name_sanitizer(metric)
+        self._validate_export_metric_name(sanitized)
+        return sanitized
+
+    @staticmethod
+    def _validate_metric_name(metric: str) -> None:
+        if not isinstance(metric, str) or not metric:
+            raise ValueError("metric name must be a non-empty string")
+
+    @staticmethod
+    def _validate_export_metric_name(metric: str) -> None:
+        MetricsCollector._validate_metric_name(metric)
+        if not _SAFE_METRIC_RE.match(metric):
+            raise ValueError("metric name contains unsupported characters")
+
+    @staticmethod
+    def _sanitize_metric_name(metric: str) -> str:
+        MetricsCollector._validate_metric_name(metric)
+        sanitized_segments = []
+        changed = False
+        for segment in metric.split("."):
+            if (
+                _SAFE_SEGMENT_RE.match(segment)
+                and not _SENSITIVE_SEGMENT_RE.search(segment)
+            ):
+                sanitized_segments.append(segment)
+                continue
+            sanitized_segments.append("_redacted")
+            changed = True
+        if not changed:
+            return metric
+        digest = hashlib.sha256(metric.encode("utf-8")).hexdigest()[:8]
+        return ".".join(sanitized_segments + [digest])
 
 
 metrics = MetricsCollector()
