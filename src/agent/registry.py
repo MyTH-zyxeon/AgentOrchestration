@@ -1,10 +1,10 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import hashlib
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class AgentStatus(Enum):
@@ -21,8 +21,17 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._authorized_principals: Dict[str, set] = {}
+        self._authorization_generation = 0
+        self._resolution_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._authorization_audit: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -45,7 +54,81 @@ class AgentRegistry:
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def set_authorization(
+        self,
+        agent_id: str,
+        principal: str,
+        allowed: bool = True,
+    ) -> bool:
+        if agent_id not in self._agents:
+            return False
+        self._validate_principal(principal)
+        principals = self._authorized_principals.setdefault(agent_id, set())
+        if allowed:
+            principals.add(principal)
+            action = "authorization_granted"
+        else:
+            principals.discard(principal)
+            action = "authorization_revoked"
+            if not principals:
+                self._authorized_principals.pop(agent_id, None)
+        self._authorization_generation += 1
+        self._invalidate_resolution_cache(agent_id, principal)
+        self._record_authorization_event(action, agent_id, principal)
+        return True
+
+    def resolve_authorized(
+        self,
+        agent_id: str,
+        principal: str,
+    ) -> Optional[Dict[str, Any]]:
+        self._validate_principal(principal)
+        cache_key = (agent_id, principal)
+        cached = self._resolution_cache.get(cache_key)
+        if cached and cached["generation"] == self._authorization_generation:
+            if self._is_authorized(agent_id, principal):
+                self._record_authorization_event(
+                    "resolution_cache_hit",
+                    agent_id,
+                    principal,
+                )
+                return self._agents.get(agent_id)
+            self._resolution_cache.pop(cache_key, None)
+
+        agent = self._agents.get(agent_id)
+        if agent is None:
+            self._resolution_cache.pop(cache_key, None)
+            self._record_authorization_event(
+                "resolution_missing_agent",
+                agent_id,
+                principal,
+            )
+            return None
+        if not self._is_authorized(agent_id, principal):
+            self._resolution_cache.pop(cache_key, None)
+            self._record_authorization_event(
+                "resolution_denied",
+                agent_id,
+                principal,
+            )
+            return None
+
+        self._resolution_cache[cache_key] = {
+            "generation": self._authorization_generation,
+            "cached_at": time.time(),
+        }
+        self._record_authorization_event(
+            "resolution_allowed",
+            agent_id,
+            principal,
+        )
+        return agent
+
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -68,10 +151,51 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._authorized_principals.pop(agent_id, None)
+        self._invalidate_resolution_cache(agent_id)
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def authorization_audit(self) -> List[Dict[str, Any]]:
+        return list(self._authorization_audit)
+
+    def _is_authorized(self, agent_id: str, principal: str) -> bool:
+        return principal in self._authorized_principals.get(agent_id, set())
+
+    def _invalidate_resolution_cache(
+        self,
+        agent_id: str,
+        principal: Optional[str] = None,
+    ) -> None:
+        for cache_key in list(self._resolution_cache):
+            cached_agent_id, cached_principal = cache_key
+            if cached_agent_id != agent_id:
+                continue
+            if principal is not None and cached_principal != principal:
+                continue
+            self._resolution_cache.pop(cache_key, None)
+
+    def _record_authorization_event(
+        self,
+        action: str,
+        agent_id: str,
+        principal: str,
+    ) -> None:
+        digest = hashlib.sha256(principal.encode("utf-8")).hexdigest()[:12]
+        self._authorization_audit.append({
+            "action": action,
+            "agent_id": agent_id,
+            "principal_hash": digest,
+            "generation": self._authorization_generation,
+            "timestamp": time.time(),
+        })
+
+    @staticmethod
+    def _validate_principal(principal: str) -> None:
+        if not isinstance(principal, str) or not principal:
+            raise ValueError("principal must be a non-empty string")
 
 # 2019-01-29T11:24:49 update
 

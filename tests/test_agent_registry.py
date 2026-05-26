@@ -48,6 +48,60 @@ class TestAgentRegistry:
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
 
+    def test_resolve_authorized_rechecks_cached_permission(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.set_authorization(agent_id, "tenant-a")
+        resolved = self.registry.resolve_authorized(agent_id, "tenant-a")
+        assert resolved["id"] == agent_id
+
+        assert self.registry.set_authorization(
+            agent_id,
+            "tenant-a",
+            allowed=False,
+        )
+
+        assert self.registry.resolve_authorized(agent_id, "tenant-a") is None
+        assert (agent_id, "tenant-a") not in self.registry._resolution_cache
+
+    def test_cached_resolution_is_scoped_by_principal(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.set_authorization(agent_id, "tenant-a")
+
+        resolved = self.registry.resolve_authorized(agent_id, "tenant-a")
+        assert resolved["id"] == agent_id
+        assert self.registry.resolve_authorized(agent_id, "tenant-b") is None
+
+    def test_delete_invalidates_authorized_resolution_cache(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.set_authorization(agent_id, "tenant-a")
+        resolved = self.registry.resolve_authorized(agent_id, "tenant-a")
+        assert resolved["id"] == agent_id
+
+        assert self.registry.delete(agent_id)
+
+        assert self.registry.resolve_authorized(agent_id, "tenant-a") is None
+        assert not self.registry._resolution_cache
+
+    def test_authorization_audit_uses_sanitized_principal_hash(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.set_authorization(agent_id, "tenant-secret")
+        resolved = self.registry.resolve_authorized(agent_id, "tenant-secret")
+        assert resolved["id"] == agent_id
+
+        audit = self.registry.authorization_audit()
+        assert audit[-1]["action"] == "resolution_allowed"
+        assert audit[-1]["principal_hash"] != "tenant-secret"
+        assert all("tenant-secret" not in str(event) for event in audit)
+
+    def test_authorization_rejects_empty_principal(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+
+        with pytest.raises(
+            ValueError,
+            match="principal must be a non-empty string",
+        ):
+            self.registry.set_authorization(agent_id, "")
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update
