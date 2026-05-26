@@ -1,6 +1,7 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
 from enum import Enum
+import time
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
@@ -14,7 +15,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -33,6 +40,11 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.revision = 0
+        self.finalization_attempt: Optional[str] = None
+        self.finalized_at: Optional[float] = None
+        self.terminal_reason: Optional[str] = None
+        self.audit_records: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -44,6 +56,8 @@ class Workflow:
 
 
 class WorkflowManager:
+    _TERMINAL_STATUSES = {StepStatus.COMPLETED, StepStatus.FAILED}
+
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
 
@@ -61,11 +75,89 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def finalize_workflow(
+        self,
+        workflow_id: str,
+        status: StepStatus,
+        attempt_id: str,
+        revision: int,
+        reason: str = "",
+    ) -> bool:
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return False
+
+        if status not in self._TERMINAL_STATUSES:
+            self._record_finalization_audit(
+                workflow,
+                "rejected_non_terminal",
+                attempt_id,
+                revision,
+                status,
+            )
+            return False
+
+        if workflow.status in self._TERMINAL_STATUSES:
+            self._record_finalization_audit(
+                workflow,
+                "ignored_duplicate_terminal",
+                attempt_id,
+                revision,
+                status,
+            )
+            return False
+
+        if revision != workflow.revision:
+            self._record_finalization_audit(
+                workflow,
+                "rejected_stale_revision",
+                attempt_id,
+                revision,
+                status,
+            )
+            return False
+
+        workflow.status = status
+        workflow.finalization_attempt = attempt_id
+        workflow.terminal_reason = reason
+        workflow.finalized_at = time.time()
+        workflow.revision += 1
+        self._record_finalization_audit(
+            workflow,
+            "accepted_terminal",
+            attempt_id,
+            revision,
+            status,
+        )
+        return True
+
+    def _record_finalization_audit(
+        self,
+        workflow: Workflow,
+        decision: str,
+        attempt_id: str,
+        revision: int,
+        status: StepStatus,
+    ) -> None:
+        workflow.audit_records.append(
+            {
+                "decision": decision,
+                "workflow_id": workflow.id,
+                "attempt_id": attempt_id,
+                "revision": revision,
+                "current_revision": workflow.revision,
+                "requested_status": status.value,
+                "current_status": workflow.status.value,
+            }
+        )
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
+        attempt_id = str(uuid4())
+        start_revision = workflow.revision
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
@@ -76,11 +168,22 @@ class WorkflowManager:
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
+                self.finalize_workflow(
+                    workflow_id,
+                    StepStatus.FAILED,
+                    attempt_id,
+                    start_revision,
+                    reason=step.name,
+                )
                 return False
 
-        workflow.status = StepStatus.COMPLETED
-        return True
+        return self.finalize_workflow(
+            workflow_id,
+            StepStatus.COMPLETED,
+            attempt_id,
+            start_revision,
+            reason="all_steps_completed",
+        )
 
 # 2019-03-27T19:58:07 update
 
