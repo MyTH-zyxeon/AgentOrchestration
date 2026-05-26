@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,59 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_worker_disconnect_reclaims_reserved_task_once(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        assert self.scheduler.worker_disconnect("worker-a") == 1
+        assert self.scheduler.worker_disconnect("worker-a") == 0
+
+        reclaimed = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+        assert reclaimed["id"] == task["id"]
+        assert reclaimed["reserved_by"] == "worker-b"
+        assert reclaimed["reclaim_count"] == 1
+        assert self.scheduler.complete(reclaimed["id"], worker_id="worker-b")
+
+    def test_stale_worker_cannot_ack_reclaimed_task(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        self.scheduler.worker_disconnect("worker-a")
+        reclaimed = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+
+        assert reclaimed["id"] == task["id"]
+        assert not self.scheduler.complete(task["id"], worker_id="worker-a")
+        assert self.scheduler.complete(task["id"], worker_id="worker-b")
+        assert self.scheduler.audit_records[-2]["event"] == "ack_rejected"
+        assert self.scheduler.audit_records[-2]["reason"] == "worker_mismatch"
+
+    def test_expired_reservation_is_reclaimed_before_dequeue(self):
+        self.scheduler.enqueue({"type": "test"})
+        task = asyncio.run(
+            self.scheduler.dequeue(
+                worker_id="worker-a",
+                reservation_ttl=-1.0,
+            )
+        )
+
+        reclaimed = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+
+        assert reclaimed["id"] == task["id"]
+        assert reclaimed["reserved_by"] == "worker-b"
+        assert self.scheduler.audit_records[0]["reason"] == "expired"
 
 # 2019-01-09T19:07:03 update
 
