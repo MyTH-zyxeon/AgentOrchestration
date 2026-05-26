@@ -48,6 +48,56 @@ class TestAgentRegistry:
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
 
+    def test_resolve_handlers_filters_by_compatible_rpc_protocol(self):
+        compatible = self.registry.register(
+            "agent-1",
+            "worker.processor",
+            {"rpc_protocol": "agent-rpc", "rpc_version": "1.2.0"},
+        )
+        self.registry.update_status(compatible, AgentStatus.RUNNING)
+
+        handlers = self.registry.resolve_handlers(
+            "worker.processor",
+            rpc_protocol="agent-rpc",
+            rpc_version="1.0.0",
+        )
+
+        assert [handler["id"] for handler in handlers] == [compatible]
+
+    def test_register_rejects_incompatible_rpc_protocol(self):
+        with pytest.raises(ValueError, match="Incompatible"):
+            self.registry.register(
+                "agent-1",
+                "worker.processor",
+                {"rpc_protocol": "agent-rpc", "rpc_version": "2.0.0"},
+            )
+
+        assert self.registry.count() == 0
+
+    def test_negotiation_rejects_upgrade_without_lifecycle_change(self):
+        agent_id = self.registry.register("agent-1", "worker.processor")
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        assert not self.registry.negotiate_protocol(
+            agent_id,
+            "agent-rpc",
+            "2.0.0",
+        )
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RUNNING.value
+        assert agent["rpc_version"] == "1.0.0"
+        assert self.registry.audit_records()[-1]["decision"] == "rejected"
+
+    def test_resolve_cache_is_invalidated_on_status_change(self):
+        agent_id = self.registry.register("agent-1", "worker.processor")
+        assert self.registry.resolve_handlers("worker.processor") == []
+
+        self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        handlers = self.registry.resolve_handlers("worker.processor")
+
+        assert [handler["id"] for handler in handlers] == [agent_id]
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update
