@@ -2,7 +2,7 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Iterable, Set
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,9 +10,60 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+class MethodGuardMiddleware(BaseHTTPMiddleware):
+    allowed_methods_header = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
+
+    def __init__(self, app, blocked_methods: Iterable[str] = None):
+        super().__init__(app)
+        methods = blocked_methods or {"TRACE"}
+        self.blocked_methods: Set[str] = {
+            method.upper()
+            for method in methods
+        }
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        method = request.method.upper()
+        request.state.method_guard = {
+            "method": method,
+            "blocked": method in self.blocked_methods,
+        }
+        try:
+            if method in self.blocked_methods:
+                logger.warning(
+                    "Rejected disallowed HTTP method %s "
+                    "at middleware boundary",
+                    method,
+                )
+                return Response(
+                    status_code=405,
+                    content="Method Not Allowed",
+                    headers={
+                        "Allow": self.allowed_methods_header,
+                        "X-Method-Guard": "blocked",
+                    },
+                )
+
+            response = await call_next(request)
+            response.headers.setdefault("X-Method-Guard", "passed")
+            return response
+        finally:
+            request.state._state.pop("method_guard", None)
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +77,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +101,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
