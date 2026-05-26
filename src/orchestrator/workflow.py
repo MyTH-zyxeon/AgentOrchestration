@@ -14,7 +14,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -46,10 +52,15 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._workflow_revisions: Dict[str, int] = {}
+        self._deleted_revisions: Dict[str, int] = {}
+        self._active_polls: Dict[str, Dict[str, Any]] = {}
+        self._audit_records: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
         self._workflows[workflow.id] = workflow
+        self._workflow_revisions[workflow.id] = 1
         return workflow
 
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
@@ -59,7 +70,99 @@ class WorkflowManager:
         return list(self._workflows.values())
 
     def delete_workflow(self, workflow_id: str) -> bool:
-        return self._workflows.pop(workflow_id, None) is not None
+        if self._workflows.pop(workflow_id, None) is None:
+            return False
+
+        revision = self._workflow_revisions.pop(workflow_id, 0) + 1
+        self._deleted_revisions[workflow_id] = revision
+        cancelled_polls = 0
+        for poll in self._active_polls.values():
+            if poll["workflow_id"] == workflow_id:
+                poll["cancelled"] = True
+                cancelled_polls += 1
+
+        self._record_audit(
+            "workflow_deleted",
+            workflow_id=workflow_id,
+            revision=revision,
+            cancelled_polls=cancelled_polls,
+        )
+        return True
+
+    def start_poll(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        if workflow_id not in self._workflows:
+            reason = (
+                "workflow_deleted"
+                if workflow_id in self._deleted_revisions
+                else "workflow_missing"
+            )
+            self._record_audit(
+                "poll_rejected",
+                workflow_id=workflow_id,
+                reason=reason,
+            )
+            return None
+
+        poll_id = str(uuid4())
+        revision = self._workflow_revisions[workflow_id]
+        poll = {
+            "poll_id": poll_id,
+            "workflow_id": workflow_id,
+            "revision": revision,
+            "cancelled": False,
+        }
+        self._active_polls[poll_id] = poll
+        self._record_audit(
+            "poll_started",
+            workflow_id=workflow_id,
+            poll_id=poll_id,
+            revision=revision,
+        )
+        return dict(poll)
+
+    def complete_poll(self, poll_id: str) -> bool:
+        poll = self._active_polls.pop(poll_id, None)
+        if poll is None:
+            self._record_audit(
+                "poll_rejected",
+                poll_id=poll_id,
+                reason="poll_missing",
+            )
+            return False
+
+        workflow_id = poll["workflow_id"]
+        current_revision = self._workflow_revisions.get(workflow_id)
+        if (
+            poll["cancelled"]
+            or workflow_id not in self._workflows
+            or current_revision != poll["revision"]
+        ):
+            reason = (
+                "workflow_deleted"
+                if workflow_id in self._deleted_revisions
+                else "revision_changed"
+            )
+            self._record_audit(
+                "poll_rejected",
+                workflow_id=workflow_id,
+                poll_id=poll_id,
+                expected_revision=poll["revision"],
+                current_revision=current_revision
+                or self._deleted_revisions.get(workflow_id),
+                reason=reason,
+            )
+            return False
+
+        self._record_audit(
+            "poll_completed",
+            workflow_id=workflow_id,
+            poll_id=poll_id,
+            revision=current_revision,
+        )
+        return True
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._audit_records]
 
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
@@ -68,19 +171,35 @@ class WorkflowManager:
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
+            poll = self.start_poll(workflow_id)
+            if poll is None:
+                workflow.status = StepStatus.SKIPPED
+                return False
+
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
-                step.result = result
-                step.status = StepStatus.COMPLETED
-            except Exception as e:
-                step.error = str(e)
+            except Exception as exc:
+                step.error = str(exc)
                 step.status = StepStatus.FAILED
                 workflow.status = StepStatus.FAILED
                 return False
 
+            if not self.complete_poll(poll["poll_id"]):
+                step.status = StepStatus.SKIPPED
+                workflow.status = StepStatus.SKIPPED
+                return False
+
+            step.result = result
+            step.status = StepStatus.COMPLETED
+
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _record_audit(self, event: str, **fields: Any) -> None:
+        record = {"event": event}
+        record.update(fields)
+        self._audit_records.append(record)
 
 # 2019-03-27T19:58:07 update
 
