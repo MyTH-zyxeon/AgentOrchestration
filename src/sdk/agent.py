@@ -9,7 +9,9 @@ logger = logging.getLogger(__name__)
 
 
 class BaseAgent(ABC):
-    def __init__(self, agent_id: str, name: str, config: Optional[Dict] = None):
+    def __init__(
+        self, agent_id: str, name: str, config: Optional[Dict] = None
+    ):
         self.agent_id = agent_id
         self.name = name
         self.config = config or {}
@@ -45,6 +47,10 @@ class BaseAgent(ABC):
         self._running = False
 
     def set_metadata(self, key: str, value: Any) -> None:
+        if not isinstance(key, str):
+            raise TypeError("Metadata key must be a string")
+        if not key.strip():
+            raise ValueError("Metadata key must be a non-empty string")
         self._metadata[key] = value
 
     def get_metadata(self, key: str, default: Any = None) -> Any:
